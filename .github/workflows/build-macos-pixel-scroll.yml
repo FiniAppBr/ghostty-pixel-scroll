@@ -84,6 +84,23 @@ jobs:
             "$PWD/zig-aarch64-macos-${ZIG_VERSION}/zig" version
           } 2>&1 | tee -a "$CI_LOG"
 
+      # The parts of this branch that are ours are pure logic and carry
+      # their own tests. Running them before the app build means a broken
+      # state machine fails in seconds rather than after a full Xcode
+      # build, and the failure is legible in the log we push back.
+      - name: Unit tests
+        id: tests
+        run: |
+          set -eo pipefail
+          {
+            echo "=== tests === $(date -u +%T)"
+            zig build test \
+              -Dtest-filter=prediction \
+              -Dtest-filter=animation \
+              -Doptimize=Debug
+            echo "tests passed"
+          } 2>&1 | tee -a "$CI_LOG"
+
       # GhosttyKit is the Zig side, consumed by the Xcode project.
       - name: Build GhosttyKit
         id: ghosttykit
