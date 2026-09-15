@@ -71,10 +71,13 @@ jobs:
           {
             echo "=== xcodebuild ==="
             xcodebuild -list -project Ghostty.xcodeproj || true
-            xcodebuild -target Ghostty -configuration Release \
+            # -derivedDataPath requires -scheme (not -target), and
+            # ReleaseLocal is the configuration upstream uses for unsigned
+            # local builds. Signing is left enabled but ad-hoc ("-"), since
+            # the embedded Sparkle framework still needs to be signed.
+            xcodebuild -scheme Ghostty -configuration ReleaseLocal \
               CODE_SIGN_IDENTITY="-" \
               CODE_SIGNING_REQUIRED=NO \
-              CODE_SIGNING_ALLOWED=NO \
               -derivedDataPath "$RUNNER_TEMP/DerivedData"
           } 2>&1 | tee -a "$CI_LOG"
 
