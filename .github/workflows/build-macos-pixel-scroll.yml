@@ -4,6 +4,10 @@ name: Build macOS (pixel-scroll, unsigned)
 # macOS runners ship Xcode, which is the only reason this exists: the
 # machine this branch is developed on has Command Line Tools only, so the
 # app itself can only be built here.
+#
+# The last step pushes the outcome and the build log to the `ci-results`
+# branch. That's so the result can be read over plain git (`git fetch`),
+# without a GitHub token, from a machine that only has SSH access.
 
 on:
   workflow_dispatch:
@@ -13,55 +17,128 @@ on:
 jobs:
   build:
     runs-on: macos-latest
+    permissions:
+      contents: write
+    env:
+      CI_LOG: ${{ github.workspace }}/../ci.log
     steps:
       - uses: actions/checkout@v5
 
       - name: Use the newest installed Xcode
+        id: xcode
         run: |
-          set -e
-          newest="$(ls -d /Applications/Xcode_*.app 2>/dev/null | sort -V | tail -1 || true)"
-          if [ -n "$newest" ]; then sudo xcode-select -s "$newest"; fi
-          xcodebuild -version
-          sw_vers
+          set -eo pipefail
+          {
+            echo "=== xcode ==="
+            newest="$(ls -d /Applications/Xcode_*.app 2>/dev/null | sort -V | tail -1 || true)"
+            if [ -n "$newest" ]; then sudo xcode-select -s "$newest"; fi
+            xcodebuild -version
+            sw_vers
+            ls -d /Applications/Xcode*.app 2>/dev/null || true
+          } 2>&1 | tee -a "$CI_LOG"
 
       - name: Install Zig
+        id: zig
         run: |
-          set -e
-          ZIG_VERSION="$(grep -o 'minimum_zig_version = "[^"]*"' build.zig.zon | cut -d'"' -f2)"
-          echo "Using Zig $ZIG_VERSION"
-          curl -sL -o zig.tar.xz "https://ziglang.org/download/${ZIG_VERSION}/zig-aarch64-macos-${ZIG_VERSION}.tar.xz"
-          tar xf zig.tar.xz
-          echo "$PWD/zig-aarch64-macos-${ZIG_VERSION}" >> "$GITHUB_PATH"
-
-      - name: Zig version
-        run: zig version
+          set -eo pipefail
+          {
+            echo "=== zig ==="
+            ZIG_VERSION="$(grep -o 'minimum_zig_version = "[^"]*"' build.zig.zon | cut -d'"' -f2)"
+            echo "Using Zig $ZIG_VERSION"
+            curl -sL -o zig.tar.xz "https://ziglang.org/download/${ZIG_VERSION}/zig-aarch64-macos-${ZIG_VERSION}.tar.xz"
+            tar xf zig.tar.xz
+            echo "$PWD/zig-aarch64-macos-${ZIG_VERSION}" >> "$GITHUB_PATH"
+            "$PWD/zig-aarch64-macos-${ZIG_VERSION}/zig" version
+          } 2>&1 | tee -a "$CI_LOG"
 
       # GhosttyKit is the Zig side, consumed by the Xcode project.
       - name: Build GhosttyKit
-        run: zig build -Demit-macos-app=false -Doptimize=ReleaseFast -Dxcframework-target=native
+        id: ghosttykit
+        run: |
+          set -eo pipefail
+          {
+            echo "=== GhosttyKit ==="
+            zig build -Demit-macos-app=false -Doptimize=ReleaseFast -Dxcframework-target=native
+          } 2>&1 | tee -a "$CI_LOG"
 
       # Built with Xcode tooling and ad-hoc signed: no Developer ID here,
       # so the download needs its quarantine bit stripped before it runs.
       - name: Build Ghostty.app
+        id: app
         working-directory: macos
         run: |
-          xcodebuild -target Ghostty -configuration Release \
-            CODE_SIGN_IDENTITY="-" \
-            CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGNING_ALLOWED=NO \
-            -derivedDataPath "$RUNNER_TEMP/DerivedData"
+          set -eo pipefail
+          {
+            echo "=== xcodebuild ==="
+            xcodebuild -list -project Ghostty.xcodeproj || true
+            xcodebuild -target Ghostty -configuration Release \
+              CODE_SIGN_IDENTITY="-" \
+              CODE_SIGNING_REQUIRED=NO \
+              CODE_SIGNING_ALLOWED=NO \
+              -derivedDataPath "$RUNNER_TEMP/DerivedData"
+          } 2>&1 | tee -a "$CI_LOG"
 
       - name: Package
+        id: package
         run: |
-          set -e
-          APP="$(find "$RUNNER_TEMP/DerivedData" -name 'Ghostty.app' -maxdepth 4 -type d | head -1)"
-          if [ -z "$APP" ]; then echo "Ghostty.app not found"; exit 1; fi
-          echo "Found: $APP"
-          codesign --force --deep --sign - "$APP"
-          ditto -c -k --keepParent "$APP" ghostty-macos-pixel-scroll.zip
+          set -eo pipefail
+          {
+            echo "=== package ==="
+            APP="$(find "$RUNNER_TEMP/DerivedData" -name 'Ghostty.app' -maxdepth 6 -type d | head -1)"
+            if [ -z "$APP" ]; then echo "Ghostty.app not found"; exit 1; fi
+            echo "Found: $APP"
+            codesign --force --deep --sign - "$APP"
+            ditto -c -k --keepParent "$APP" ghostty-macos-pixel-scroll.zip
+            ls -lh ghostty-macos-pixel-scroll.zip
+          } 2>&1 | tee -a "$CI_LOG"
 
       - uses: actions/upload-artifact@v4
+        if: success()
         with:
           name: ghostty-macos-pixel-scroll
           path: ghostty-macos-pixel-scroll.zip
           if-no-files-found: error
+
+      # Report the outcome where a token-less machine can read it.
+      - name: Publish result to ci-results branch
+        if: always()
+        run: |
+          set +e
+          WORK="$RUNNER_TEMP/report"
+          rm -rf "$WORK"; mkdir -p "$WORK"; cd "$WORK"
+
+          cp "$CI_LOG" build.log 2>/dev/null || echo "(no log captured)" > build.log
+          tail -c 300000 build.log > build.tail.log
+          grep -nE "error:|error!|failed|FAILED|\*\* BUILD FAILED" build.log | tail -100 > errors.txt
+
+          cat > status.md <<EOF
+          # CI result
+
+          - run: ${{ github.run_id }} (attempt ${{ github.run_attempt }})
+          - sha: ${{ github.sha }}
+          - ref: ${{ github.ref_name }}
+          - job status: ${{ job.status }}
+          - finished: $(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+          ## step outcomes
+
+          | step | outcome |
+          | --- | --- |
+          | xcode select | ${{ steps.xcode.outcome }} |
+          | install zig | ${{ steps.zig.outcome }} |
+          | build GhosttyKit | ${{ steps.ghosttykit.outcome }} |
+          | build Ghostty.app | ${{ steps.app.outcome }} |
+          | package | ${{ steps.package.outcome }} |
+
+          See build.tail.log for the log and errors.txt for grepped failures.
+          EOF
+
+          git init -q .
+          git checkout -q -b ci-results
+          git add -A
+          git -c user.name="ghostty-ci" -c user.email="ci@example.invalid" \
+            commit -q -m "CI ${{ job.status }} for ${{ github.sha }} (run ${{ github.run_id }})"
+          git push -q --force \
+            "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" \
+            ci-results
+          echo "pushed ci-results: $?"
