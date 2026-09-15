@@ -26,6 +26,7 @@ const simd = @import("simd/main.zig");
 const crash = @import("crash/main.zig");
 const unicode = @import("unicode/main.zig");
 const rendererpkg = @import("renderer.zig");
+const predictionpkg = @import("renderer/prediction.zig");
 const termio = @import("termio.zig");
 const font = @import("font/main.zig");
 const Command = @import("Command.zig");
@@ -2908,27 +2909,18 @@ fn recordPrediction(self: *Surface, event: input.KeyEvent) void {
     pred.config.timeout = self.config.local_echo_timeout;
     pred.config.eager = self.config.local_echo == .always;
 
-    // Only a plain press of a printable character. A modifier that turns
-    // the key into something else, a control character, or anything that
-    // is not exactly one codepoint, all move the cursor in ways we would
-    // only be guessing at. Shift is fine: that is just capitals.
-    const cp: u21 = cp: {
-        if (event.action == .release) break :cp 0;
-        if (event.mods.ctrl or event.mods.alt or event.mods.super) break :cp 0;
-        if (event.utf8.len == 0) break :cp 0;
-
-        const seq = std.unicode.utf8ByteSequenceLength(event.utf8[0]) catch break :cp 0;
-        if (seq != event.utf8.len) break :cp 0;
-
-        const decoded = std.unicode.utf8Decode(event.utf8) catch break :cp 0;
-        if (decoded < 0x20 or decoded == 0x7f) break :cp 0;
-        break :cp decoded;
-    };
-
-    if (cp == 0) {
+    // Whether this key is one whose effect we can place is decided in
+    // prediction.zig, where it can be tested without a terminal.
+    const cp = predictionpkg.classify(
+        event.utf8,
+        event.action == .release,
+        event.mods.ctrl,
+        event.mods.alt,
+        event.mods.super,
+    ) orelse {
         pred.flush();
         return;
-    }
+    };
 
     const t = self.io.terminal;
 

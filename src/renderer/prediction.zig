@@ -233,6 +233,44 @@ pub const Engine = struct {
     }
 };
 
+/// Whether a keypress is one whose effect on the screen we can place, and
+/// if so which character it puts there. Null means it is not: the caller
+/// should abandon what is in flight rather than guess past it.
+///
+/// This lives here, apart from the key event types, so that the decision
+/// can be tested directly. It is the decision that matters most: getting
+/// it wrong is what would draw a character that never arrives, or worse,
+/// draw one at a prompt that is not echoing.
+pub fn classify(
+    utf8: []const u8,
+    release: bool,
+    ctrl: bool,
+    alt: bool,
+    super: bool,
+) ?u21 {
+    // A release puts nothing on screen.
+    if (release) return null;
+
+    // These turn the key into a command rather than a character. Shift is
+    // deliberately absent: that is just capitals.
+    if (ctrl or alt or super) return null;
+
+    // Keys that produce no text — arrows, function keys, escape.
+    if (utf8.len == 0) return null;
+
+    // Exactly one codepoint, or we cannot say what lands where.
+    const seq = std.unicode.utf8ByteSequenceLength(utf8[0]) catch return null;
+    if (seq != utf8.len) return null;
+
+    const cp = std.unicode.utf8Decode(utf8) catch return null;
+
+    // Control characters and delete each move the cursor their own way:
+    // return, tab, backspace. None of them simply occupy the next cell.
+    if (cp < 0x20 or cp == 0x7f) return null;
+
+    return cp;
+}
+
 /// Drive `e` to the predicting epoch the honest way, by echoing back what
 /// it is told. Used by the tests below.
 fn warmUp(e: *Engine, now: f32) void {
@@ -241,6 +279,56 @@ fn warmUp(e: *Engine, now: f32) void {
         _ = e.typed('a', 0, 0, 80, now);
         _ = e.echoed('a');
     }
+}
+
+test "classify accepts a plain character" {
+    try std.testing.expectEqual(@as(?u21, 'a'), classify("a", false, false, false, false));
+    try std.testing.expectEqual(@as(?u21, 'A'), classify("A", false, false, false, false));
+    try std.testing.expectEqual(@as(?u21, ' '), classify(" ", false, false, false, false));
+    try std.testing.expectEqual(@as(?u21, '/'), classify("/", false, false, false, false));
+
+    // Non-ASCII is still a character that occupies the next cell.
+    try std.testing.expectEqual(@as(?u21, 'ç'), classify("ç", false, false, false, false));
+    try std.testing.expectEqual(@as(?u21, 'ã'), classify("ã", false, false, false, false));
+}
+
+test "classify refuses keys that are commands rather than characters" {
+    // ctrl-c, alt-f, cmd-v: these do things, they do not type.
+    try std.testing.expectEqual(@as(?u21, null), classify("c", false, true, false, false));
+    try std.testing.expectEqual(@as(?u21, null), classify("f", false, false, true, false));
+    try std.testing.expectEqual(@as(?u21, null), classify("v", false, false, false, true));
+
+    // Shift is not one of them.
+    try std.testing.expectEqual(@as(?u21, 'A'), classify("A", false, false, false, false));
+}
+
+test "classify refuses keys that move the cursor their own way" {
+    // Return, tab, backspace, escape, and delete.
+    try std.testing.expectEqual(@as(?u21, null), classify("\r", false, false, false, false));
+    try std.testing.expectEqual(@as(?u21, null), classify("\n", false, false, false, false));
+    try std.testing.expectEqual(@as(?u21, null), classify("\t", false, false, false, false));
+    try std.testing.expectEqual(@as(?u21, null), classify("\x08", false, false, false, false));
+    try std.testing.expectEqual(@as(?u21, null), classify("\x1b", false, false, false, false));
+    try std.testing.expectEqual(@as(?u21, null), classify("\x7f", false, false, false, false));
+}
+
+test "classify refuses keys that produce no text at all" {
+    // Arrows and function keys arrive with an empty utf8.
+    try std.testing.expectEqual(@as(?u21, null), classify("", false, false, false, false));
+}
+
+test "classify refuses a release" {
+    try std.testing.expectEqual(@as(?u21, null), classify("a", true, false, false, false));
+}
+
+test "classify refuses anything that is not exactly one codepoint" {
+    // A paste or a dead-key sequence is more than one cell's worth.
+    try std.testing.expectEqual(@as(?u21, null), classify("ab", false, false, false, false));
+    try std.testing.expectEqual(@as(?u21, null), classify("hello", false, false, false, false));
+
+    // Truncated or invalid UTF-8 must not decode to something plausible.
+    try std.testing.expectEqual(@as(?u21, null), classify("\xc3", false, false, false, false));
+    try std.testing.expectEqual(@as(?u21, null), classify("\xff", false, false, false, false));
 }
 
 test "nothing is drawn until echo has been seen working" {
