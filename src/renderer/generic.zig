@@ -16,6 +16,7 @@ const link = @import("link.zig");
 const cellpkg = @import("cell.zig");
 const animationpkg = @import("animation.zig");
 const predictionpkg = @import("prediction.zig");
+const cursor_rect = @import("cursor_rect.zig");
 const noMinContrast = cellpkg.noMinContrast;
 const constraintWidth = cellpkg.constraintWidth;
 const isCovering = cellpkg.isCovering;
@@ -291,6 +292,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// corners sooner than the trailing ones, so it stretches between
         /// the two cells on the way.
         cursor_corners: animationpkg.CornerCursor = .{},
+
+        /// The custom shader cursor rectangle with no animation applied, so
+        /// that `previous_cursor` can keep meaning "the cell the cursor came
+        /// from". The drawn rectangle moves every frame while anything is
+        /// animating, and a trail drawn between two consecutive frames of
+        /// that is a stub, not a trail.
+        custom_shader_cursor_cell: [4]f32 = .{ 0, 0, 0, 0 },
 
         /// Text that has just appeared fades in rather than popping into
         /// place. Rows remember how far their content reached, so a line
@@ -2109,15 +2117,18 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // Upload the background image to the GPU as necessary.
             try self.uploadBackgroundImage();
 
-            // Update per-frame custom shader uniforms.
-            try self.updateCustomShaderUniformsForFrame();
-
             // Setup our frame data
             // Advance the smooth scroll animation and draw the grid at
             // wherever it has got to.
             const dt = self.animationDelta();
             self.stepScrollAnimation(dt);
             self.stepCursorAnimation(dt);
+
+            // Update per-frame custom shader uniforms. This has to come
+            // after the springs advance: it reports where the cursor is
+            // drawn, and a frame-old spring position would put it a frame
+            // behind the cursor it is supposed to be sitting on.
+            try self.updateCustomShaderUniformsForFrame();
             const cursor_offsets = self.cursor_corners.offsets();
             self.uniforms.cursor_offset_tl = cursor_offsets[0];
             self.uniforms.cursor_offset_tr = cursor_offsets[1];
@@ -2885,55 +2896,41 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             };
 
             if (self.cells.getCursorGlyph()) |cursor| {
-                const cursor_width: f32 = @floatFromInt(cursor.glyph_size[0]);
-                const cursor_height: f32 = @floatFromInt(cursor.glyph_size[1]);
-
-                // Left edge of the cell the cursor is in.
-                var pixel_x: f32 = @floatFromInt(
-                    cursor.grid_pos[0] * cell.width + padding.left,
-                );
-                // Top edge, relative to the top of the
-                // screen, of the cell the cursor is in.
-                var pixel_y: f32 = @floatFromInt(
-                    cursor.grid_pos[1] * cell.height + padding.top,
-                );
-
-                // If +Y is up in our shaders, we need to flip the coordinate
-                // so that it's instead the top edge of the cell relative to
-                // the *bottom* of the screen.
-                if (!GraphicsAPI.custom_shader_y_is_down) {
-                    pixel_y = @as(f32, @floatFromInt(screen.height)) - pixel_y;
-                }
-
-                // Add the X bearing to get the -X (left) edge of the cursor.
-                pixel_x += @floatFromInt(cursor.bearings[0]);
-
-                // How we deal with the Y bearing depends on which direction
-                // is "up", since we want our final `pixel_y` value to be the
-                // +Y edge of the cursor.
-                if (GraphicsAPI.custom_shader_y_is_down) {
-                    // As a reminder, the Y bearing is the distance from the
-                    // bottom of the cell to the top of the glyph, so to get
-                    // the +Y edge we need to add the cell height, subtract
-                    // the Y bearing, and add the glyph height to get the +Y
-                    // (bottom) edge of the cursor.
-                    pixel_y += @floatFromInt(cell.height);
-                    pixel_y -= @floatFromInt(cursor.bearings[1]);
-                    pixel_y += @floatFromInt(cursor.glyph_size[1]);
-                } else {
-                    // If the Y direction is reversed though, we instead want
-                    // the *top* edge of the cursor, which means we just need
-                    // to subtract the cell height and add the Y bearing.
-                    pixel_y -= @floatFromInt(cell.height);
-                    pixel_y += @floatFromInt(cursor.bearings[1]);
-                }
-
-                const new_cursor: [4]f32 = .{
-                    pixel_x,
-                    pixel_y,
-                    cursor_width,
-                    cursor_height,
+                // The cursor is not necessarily drawn where its cell sits:
+                // a smooth scroll displaces the whole grid, and the cursor's
+                // corner springs displace the cursor within it. Both have to
+                // be folded in, or a shader that follows the cursor trails
+                // behind it for as long as anything is animating — which,
+                // during streamed output, is the entire time.
+                const base: cursor_rect.Input = .{
+                    .cell_x = @floatFromInt(
+                        cursor.grid_pos[0] * cell.width + padding.left,
+                    ),
+                    .cell_y = @floatFromInt(
+                        cursor.grid_pos[1] * cell.height + padding.top,
+                    ),
+                    .cell_height = @floatFromInt(cell.height),
+                    .screen_height = @floatFromInt(screen.height),
+                    .bearing_x = @floatFromInt(cursor.bearings[0]),
+                    .bearing_y = @floatFromInt(cursor.bearings[1]),
+                    .glyph_width = @floatFromInt(cursor.glyph_size[0]),
+                    .glyph_height = @floatFromInt(cursor.glyph_size[1]),
                 };
+
+                // Where the cursor's cell is, and where the cursor is
+                // actually drawn this frame.
+                const cell_cursor: [4]f32 = cursor_rect.compute(
+                    GraphicsAPI.custom_shader_y_is_down,
+                    base,
+                );
+                var drawn_in = base;
+                drawn_in.grid_offset_y = self.gridYOffset();
+                drawn_in.corner_offsets = self.cursor_corners.offsets();
+                const drawn_cursor: [4]f32 = cursor_rect.compute(
+                    GraphicsAPI.custom_shader_y_is_down,
+                    drawn_in,
+                );
+
                 const cursor_color: [4]f32 = .{
                     @as(f32, @floatFromInt(cursor.color[0])) / 255.0,
                     @as(f32, @floatFromInt(cursor.color[1])) / 255.0,
@@ -2941,17 +2938,26 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     @as(f32, @floatFromInt(cursor.color[3])) / 255.0,
                 };
 
+                // A move is a move between *cells*. The drawn rectangle
+                // changes every frame while anything animates, and treating
+                // that as a move would reset the change time continuously
+                // and leave `previous_cursor` one frame behind instead of
+                // one cell behind.
                 const cursor_changed: bool =
-                    !std.meta.eql(new_cursor, uniforms.current_cursor) or
+                    !std.meta.eql(cell_cursor, self.custom_shader_cursor_cell) or
                     !std.meta.eql(cursor_color, uniforms.current_cursor_color);
 
                 if (cursor_changed) {
-                    uniforms.previous_cursor = uniforms.current_cursor;
+                    uniforms.previous_cursor = self.custom_shader_cursor_cell;
                     uniforms.previous_cursor_color = uniforms.current_cursor_color;
-                    uniforms.current_cursor = new_cursor;
                     uniforms.current_cursor_color = cursor_color;
                     uniforms.cursor_change_time = uniforms.time;
+                    self.custom_shader_cursor_cell = cell_cursor;
                 }
+
+                // The current rectangle follows the animation every frame,
+                // so a shader that rides the cursor stays on it.
+                uniforms.current_cursor = drawn_cursor;
             }
 
             // Update focus uniforms

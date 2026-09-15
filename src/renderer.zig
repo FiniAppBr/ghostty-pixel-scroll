@@ -69,4 +69,5 @@ test {
     // them here their tests are not collected.
     _ = @import("renderer/animation.zig");
     _ = @import("renderer/prediction.zig");
+    _ = @import("renderer/cursor_rect.zig");
 }
