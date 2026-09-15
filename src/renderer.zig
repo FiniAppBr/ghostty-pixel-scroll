@@ -67,6 +67,6 @@ test {
     // Imported for their own sake: these are reached only through the
     // generic renderer, which carries no test block, so without naming
     // them here their tests are not collected.
-    _ = @import("animation.zig");
-    _ = @import("prediction.zig");
+    _ = @import("renderer/animation.zig");
+    _ = @import("renderer/prediction.zig");
 }
