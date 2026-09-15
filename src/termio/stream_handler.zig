@@ -217,8 +217,15 @@ pub const StreamHandler = struct {
             const pred = &self.renderer_state.prediction;
             if (pred.len > 0) switch (action) {
                 .print => _ = pred.echoed(value.cp),
+                // printSlice carries u32s. Anything that does not narrow
+                // to a codepoint is not something we could have typed,
+                // so stop trusting what is on screen rather than guess.
                 .print_slice => for (value.cps) |cp| {
-                    _ = pred.echoed(cp);
+                    const narrow = std.math.cast(u21, cp) orelse {
+                        pred.flush();
+                        break;
+                    };
+                    _ = pred.echoed(narrow);
                 },
                 else => pred.flush(),
             };

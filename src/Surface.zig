@@ -2939,10 +2939,11 @@ fn recordPrediction(self: *Surface, event: input.KeyEvent) void {
         return;
     }
 
+    const cursor = t.screens.active.cursor;
     _ = pred.typed(
         cp,
-        @intCast(t.screen.cursor.x),
-        @intCast(t.screen.cursor.y),
+        @intCast(cursor.x),
+        @intCast(cursor.y),
         @intCast(t.cols),
         state.predictionNow(),
     );
