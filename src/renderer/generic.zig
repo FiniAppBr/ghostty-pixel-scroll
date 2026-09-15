@@ -283,6 +283,19 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         scroll_viewport_y: ?usize = null,
         scroll_clock: ?std.Io.Timestamp = null,
 
+        /// How far the viewport moved in the frame being built, in rows.
+        /// The cursor's viewport row changes when the viewport scrolls even
+        /// though the cursor hasn't moved, so cursor animation subtracts
+        /// this to find real cursor motion.
+        scroll_delta_rows: i64 = 0,
+
+        /// Smooth cursor motion state. `cursor_offset_px` is where the
+        /// cursor is drawn relative to the cell it now occupies: it starts
+        /// at the cell it came from and decays to zero.
+        cursor_offset_px: [2]f32 = .{ 0, 0 },
+        cursor_last_pos: ?[2]u16 = null,
+        cursor_clock: ?std.Io.Timestamp = null,
+
         const HighlightTag = enum(u8) {
             search_match,
             search_match_selected,
@@ -612,6 +625,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             scroll_to_bottom_on_output: bool,
             pixel_scroll: bool,
             scroll_animation_duration: f32,
+            cursor_animation_duration: f32,
             custom_shader_animation: configpkg.CustomShaderAnimation,
 
             pub fn init(
@@ -690,6 +704,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .custom_shader_animation = config.@"custom-shader-animation",
                     .pixel_scroll = config.@"pixel-scroll",
                     .scroll_animation_duration = config.@"scroll-animation-duration",
+                    .cursor_animation_duration = config.@"cursor-animation-duration",
                     .arena = arena,
                 };
             }
@@ -1140,7 +1155,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             }
 
             // A smooth scroll in flight needs draws until it settles.
-            const scroll_delay: ?u64 = if (self.scroll_offset_px != 0)
+            const scroll_delay: ?u64 = if (self.scroll_offset_px != 0 or
+                self.cursor_offset_px[0] != 0 or
+                self.cursor_offset_px[1] != 0)
                 draw_interval_ms
             else
                 null;
@@ -1548,6 +1565,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // render state (e.g. rebuildCells).
             self.terminal_state.endUpdate();
 
+            self.scroll_delta_rows = 0;
+
             // Smooth scrolling: if the viewport moved since the last frame,
             // start the grid off by the distance it moved, so content is
             // drawn where the eye last saw it, and let the animation carry
@@ -1560,6 +1579,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 if (vp_y == prev) break :scroll;
 
                 const delta_rows: i64 = @as(i64, @intCast(vp_y)) - @as(i64, @intCast(prev));
+                self.scroll_delta_rows = delta_rows;
                 const cell_height: f32 = @floatFromInt(self.grid_metrics.cell_height);
                 const offset: f32 = @as(f32, @floatFromInt(delta_rows)) * cell_height;
 
@@ -1889,6 +1909,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // Advance the smooth scroll animation and draw the grid at
             // wherever it has got to.
             self.stepScrollAnimation();
+            self.stepCursorAnimation();
+            self.uniforms.cursor_offset = self.cursor_offset_px;
             self.uniforms.projection_matrix = self.projectionMatrix(self.scroll_offset_px);
 
             try frame.uniforms.sync(&.{self.uniforms});
@@ -2296,6 +2318,34 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 @as(f32, @floatFromInt(terminal_size.height + self.size.padding.bottom)) - y_offset,
                 (-1 * @as(f32, @floatFromInt(self.size.padding.top))) - y_offset,
             );
+        }
+
+        /// Advance the smooth cursor animation toward rest. Same decay as
+        /// the scroll animation, on its own duration.
+        fn stepCursorAnimation(self: *Self) void {
+            const now: std.Io.Timestamp = .now(global.io(), .awake);
+            defer self.cursor_clock = now;
+
+            if (self.cursor_offset_px[0] == 0 and self.cursor_offset_px[1] == 0) return;
+
+            const duration = self.config.cursor_animation_duration;
+            if (duration <= 0) {
+                self.cursor_offset_px = .{ 0, 0 };
+                return;
+            }
+
+            const last = self.cursor_clock orelse return;
+            const dt_ns = last.durationTo(now).nanoseconds;
+            if (dt_ns <= 0) return;
+            const dt: f32 = @floatCast(
+                @as(f64, @floatFromInt(dt_ns)) / @as(f64, std.time.ns_per_s),
+            );
+
+            const decay = @exp(-dt / (duration / 4.0));
+            for (&self.cursor_offset_px) |*v| {
+                v.* *= decay;
+                if (@abs(v.*) < 0.5) v.* = 0;
+            }
         }
 
         /// Advance the smooth scroll animation toward rest. Called once per
@@ -2820,6 +2870,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     std.math.maxInt(u16),
                     std.math.maxInt(u16),
                 };
+                self.cursor_last_pos = null;
+                self.cursor_offset_px = .{ 0, 0 };
 
                 // If the cursor isn't visible on the viewport, don't show
                 // a cursor. Otherwise, get our cursor cell, because we may
@@ -2900,6 +2952,31 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         },
                         @intCast(cursor_vp.y),
                     };
+
+                    // Smooth cursor motion: start the cursor at the cell it
+                    // came from and let it catch up. The viewport scrolling
+                    // also changes the cursor's viewport row without the
+                    // cursor having moved, so that is subtracted out.
+                    cursor_anim: {
+                        if (self.config.cursor_animation_duration <= 0) break :cursor_anim;
+
+                        const pos: [2]u16 = .{ cursor_vp.x, @intCast(cursor_vp.y) };
+                        defer self.cursor_last_pos = pos;
+
+                        const prev = self.cursor_last_pos orelse break :cursor_anim;
+
+                        const dx: i64 = @as(i64, prev[0]) - @as(i64, pos[0]);
+                        const dy: i64 = (@as(i64, prev[1]) - @as(i64, pos[1])) -
+                            self.scroll_delta_rows;
+                        if (dx == 0 and dy == 0) break :cursor_anim;
+
+                        const cw: f32 = @floatFromInt(self.grid_metrics.cell_width);
+                        const ch: f32 = @floatFromInt(self.grid_metrics.cell_height);
+                        self.cursor_offset_px = .{
+                            self.cursor_offset_px[0] + @as(f32, @floatFromInt(dx)) * cw,
+                            self.cursor_offset_px[1] + @as(f32, @floatFromInt(dy)) * ch,
+                        };
+                    }
 
                     self.uniforms.bools.cursor_wide = switch (wide) {
                         .narrow, .spacer_head => false,

@@ -254,6 +254,15 @@ pub const Uniforms = extern struct {
         use_linear_correction: bool align(1) = false,
     },
 
+    /// Pixel offset applied to the cursor glyph only (instances with the
+    /// IS_CURSOR_GLYPH bit). Smooth cursor motion draws the cursor away
+    /// from its grid cell while it catches up.
+    ///
+    /// Must stay the last field: the shader structs append it in the same
+    /// place, where a vec2's 8-byte alignment pads predictably.
+    cursor_offset: [2]f32 align(8) = .{ 0, 0 },
+
+
     const PaddingExtend = packed struct(u8) {
         left: bool = false,
         right: bool = false,

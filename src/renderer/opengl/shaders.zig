@@ -197,6 +197,14 @@ pub const Uniforms = extern struct {
     /// Various booleans, in a packed struct for space efficiency.
     bools: Bools align(4),
 
+    /// Pixel offset applied to the cursor glyph only (instances with the
+    /// IS_CURSOR_GLYPH bit). Smooth cursor motion draws the cursor away
+    /// from its grid cell while it catches up.
+    ///
+    /// Must stay the last field: the shader structs append it in the same
+    /// place, where a vec2's 8-byte alignment pads predictably.
+    cursor_offset: [2]f32 align(8) = .{ 0, 0 },
+
     const Bools = packed struct(u32) {
         /// Whether the cursor is 2 cells wide.
         cursor_wide: bool,
@@ -220,6 +228,7 @@ pub const Uniforms = extern struct {
 
         _padding: u28 = 0,
     };
+
 
     const PaddingExtend = packed struct(u32) {
         left: bool = false,

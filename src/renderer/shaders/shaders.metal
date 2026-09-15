@@ -24,6 +24,7 @@ struct Uniforms {
   bool use_display_p3;
   bool use_linear_blending;
   bool use_linear_correction;
+  float2 cursor_offset;
 };
 
 //-------------------------------------------------------------------
@@ -561,6 +562,13 @@ vertex CellTextVertexOut cell_text_vertex(
 ) {
   // Convert the grid x, y into world space x, y by accounting for cell size
   float2 cell_pos = uniforms.cell_size * float2(in.grid_pos);
+
+  // The cursor is drawn at an offset from its cell while it animates
+  // towards a new position. Only the cursor glyph moves; the character
+  // underneath it stays where it is.
+  if ((in.bools & IS_CURSOR_GLYPH) != 0) {
+    cell_pos += uniforms.cursor_offset;
+  }
 
   // We use a triangle strip with 4 vertices to render quads,
   // so we determine which corner of the cell this vertex is in

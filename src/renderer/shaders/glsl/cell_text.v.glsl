@@ -49,6 +49,13 @@ void main() {
     // Convert the grid x, y into world space x, y by accounting for cell size
     vec2 cell_pos = cell_size * vec2(grid_pos);
 
+    // The cursor is drawn at an offset from its cell while it animates
+    // towards a new position. Only the cursor glyph moves; the character
+    // underneath it stays where it is.
+    if ((glyph_bools & IS_CURSOR_GLYPH) != 0u) {
+        cell_pos += cursor_offset;
+    }
+
     int vid = gl_VertexID;
 
     // We use a triangle strip with 4 vertices to render quads,
