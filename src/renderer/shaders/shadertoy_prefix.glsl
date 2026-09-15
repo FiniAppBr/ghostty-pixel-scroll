@@ -28,6 +28,8 @@ layout(binding = 1, std140) uniform Globals {
     uniform vec3  iCursorText;
     uniform vec3  iSelectionForegroundColor;
     uniform vec3  iSelectionBackgroundColor;
+    uniform vec4  iWriteHead;
+    uniform float iTimeWriteHead;
 };
 
 #define CURSORSTYLE_BLOCK        0

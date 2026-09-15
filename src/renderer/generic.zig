@@ -293,6 +293,20 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// the two cells on the way.
         cursor_corners: animationpkg.CornerCursor = .{},
 
+        /// The cell most recently written to, from the same tracking that
+        /// drives the text fade. A full-screen program draws with the cursor
+        /// hidden and parks it in its input box, so the cursor is not the
+        /// write position; this is what a shader has to follow to ride
+        /// streamed output.
+        write_head: ?struct {
+            y: terminal.size.CellCountInt,
+            x: u16,
+        } = null,
+
+        /// The cell the write head was last reported at, so that a scroll
+        /// settling underneath it does not read as fresh output.
+        write_head_cell: [2]u16 = .{ 0, 0 },
+
         /// The custom shader cursor rectangle with no animation applied, so
         /// that `previous_cursor` can keep meaning "the cell the cursor came
         /// from". The drawn rectangle moves every frame while anything is
@@ -947,6 +961,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .cursor_text = @splat(0),
                     .selection_background_color = @splat(0),
                     .selection_foreground_color = @splat(0),
+                    .write_head = @splat(0),
+                    .write_head_time = 0,
                 },
                 .bg_image_buffer = undefined,
 
@@ -2647,6 +2663,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             rec.x1 = len;
             rec.at = now;
             self.text_fade.until = now + self.config.text_fade_duration;
+
+            // The rightmost cell this row just gained is where the program
+            // is writing. Rows are visited top to bottom, so when several
+            // gain text in one frame the bottom one wins, which is the one
+            // output is actually advancing along.
+            self.write_head = .{ .y = y, .x = len - 1 };
         }
 
         /// Whether a row still has text on its way in, which means it has
@@ -2960,6 +2982,49 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 uniforms.current_cursor = drawn_cursor;
             }
 
+            // Where the program is writing, which is not where the cursor
+            // is: a full-screen program writes with the cursor hidden and
+            // parks it in its own input box. Reported as a cell-sized
+            // rectangle in the same shape as the cursor, so a shader can
+            // use either without knowing which it got.
+            if (self.write_head) |head| {
+                const rect: [4]f32 = cursor_rect.compute(
+                    GraphicsAPI.custom_shader_y_is_down,
+                    .{
+                        .cell_x = @floatFromInt(
+                            head.x * cell.width + padding.left,
+                        ),
+                        .cell_y = @floatFromInt(
+                            head.y * cell.height + padding.top,
+                        ),
+                        .cell_height = @floatFromInt(cell.height),
+                        .screen_height = @floatFromInt(screen.height),
+                        // A whole cell: the write head has no glyph of its
+                        // own, so its bearing is the full cell height.
+                        .bearing_x = 0,
+                        .bearing_y = @floatFromInt(cell.height),
+                        .glyph_width = @floatFromInt(cell.width),
+                        .glyph_height = @floatFromInt(cell.height),
+                        // It moves with the grid like everything else, but
+                        // carries no spring of its own.
+                        .grid_offset_y = self.gridYOffset(),
+                    },
+                );
+
+                // Only a move counts as a write. A grid still settling from
+                // a scroll shifts the rectangle every frame, and treating
+                // that as fresh output would keep an effect alive long
+                // after the program stopped writing.
+                if (!std.meta.eql(
+                    self.write_head_cell,
+                    [2]u16{ head.x, head.y },
+                )) {
+                    uniforms.write_head_time = uniforms.time;
+                    self.write_head_cell = .{ head.x, head.y };
+                }
+                uniforms.write_head = rect;
+            }
+
             // Update focus uniforms
             uniforms.focus = @intFromBool(self.focused);
 
@@ -3143,7 +3208,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // keyed by absolute row, so scrolling slides them along with
             // the text instead of making every row look freshly written.
             const fade_dur = self.config.text_fade_duration;
-            if (fade_dur > 0) fade: {
+            // The same records tell a custom shader where output is being
+            // written, so they are kept even when the fade itself is off.
+            const track_writes = fade_dur > 0 or self.has_custom_shaders;
+            if (track_writes) fade: {
                 self.text_fade.now = self.fadeNow();
                 const vp_y = self.scroll_viewport_y orelse break :fade;
                 const base: i64 = @as(i64, @intCast(vp_y)) -
@@ -3185,7 +3253,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 const row_changed = rebuild or dirty.*;
                 dirty.* = false;
 
-                if (fade_dur > 0 and row_changed) {
+                if (track_writes and row_changed) {
                     self.textFadeTrack(y, cells, self.text_fade.now);
                 }
 

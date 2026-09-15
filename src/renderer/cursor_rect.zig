@@ -201,6 +201,21 @@ test "an underline cursor sits at the bottom of the cell" {
     try std.testing.expectEqual(@as(f32, 99), centre(r)[1]);
 }
 
+test "the write head is reported as a whole cell" {
+    // The write head has no glyph of its own, so it is reported with the
+    // bearing and size of the cell it sits in. A shader then treats it
+    // exactly like a block cursor and does not need to know which it got.
+    var in = blockCursor();
+    in.bearing_x = 0;
+    in.bearing_y = in.cell_height;
+    in.glyph_width = 10;
+    in.glyph_height = in.cell_height;
+    const r = compute(true, in);
+    try std.testing.expectEqual(@as(f32, 30), r[0]);
+    try std.testing.expectEqual(@as(f32, 100), r[1]);
+    try std.testing.expectEqual(@as(f32, 90), centre(r)[1]);
+}
+
 test "+Y up and +Y down describe the same rectangle on screen" {
     const down = compute(true, blockCursor());
     const up = compute(false, blockCursor());

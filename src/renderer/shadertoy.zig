@@ -39,6 +39,14 @@ pub const Uniforms = extern struct {
     cursor_text: [4]f32 align(16),
     selection_background_color: [4]f32 align(16),
     selection_foreground_color: [4]f32 align(16),
+
+    /// The cell most recently written to, and when it changed. A
+    /// full-screen program writes with the cursor hidden and parks the
+    /// cursor somewhere else entirely, so the cursor is not the write
+    /// position and a shader that wants to follow output has to follow
+    /// this instead. Same shape as the cursor rectangle.
+    write_head: [4]f32 align(16),
+    write_head_time: f32 align(4),
 };
 
 /// The target to load shaders for.
