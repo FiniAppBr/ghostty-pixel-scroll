@@ -75,7 +75,12 @@ jobs:
             # ReleaseLocal is the configuration upstream uses for unsigned
             # local builds. Signing is left enabled but ad-hoc ("-"), since
             # the embedded Sparkle framework still needs to be signed.
+            # GhosttyKit is built for the native arch only (-Dxcframework-target=native),
+            # so Xcode must not try for a universal binary: the scheme would
+            # otherwise link x86_64 and fail on missing symbols.
             xcodebuild -scheme Ghostty -configuration ReleaseLocal \
+              ARCHS=arm64 \
+              ONLY_ACTIVE_ARCH=YES \
               CODE_SIGN_IDENTITY="-" \
               CODE_SIGNING_REQUIRED=NO \
               -derivedDataPath "$RUNNER_TEMP/DerivedData"
