@@ -270,6 +270,19 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// wakeup.
         kitty_animation_next_ms: ?u64 = null,
 
+        /// Smooth (pixel) scrolling state.
+        ///
+        /// `scroll_offset_px` is the vertical offset, in pixels, that the
+        /// grid is currently drawn at. When the viewport moves down by a
+        /// row the content would jump up by one cell; we instead start by
+        /// drawing it one cell lower (a positive offset) and decay that to
+        /// zero, so the motion reads as continuous. `scroll_viewport_y` is
+        /// the absolute screen row of the viewport top as of the previous
+        /// frame, which is how we detect that a scroll happened at all.
+        scroll_offset_px: f32 = 0,
+        scroll_viewport_y: ?usize = null,
+        scroll_clock: ?std.Io.Timestamp = null,
+
         const HighlightTag = enum(u8) {
             search_match,
             search_match_selected,
@@ -597,6 +610,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             blending: configpkg.Config.AlphaBlending,
             background_blur: configpkg.Config.BackgroundBlur,
             scroll_to_bottom_on_output: bool,
+            pixel_scroll: bool,
+            scroll_animation_duration: f32,
             custom_shader_animation: configpkg.CustomShaderAnimation,
 
             pub fn init(
@@ -673,6 +688,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .background_blur = config.@"background-blur",
                     .scroll_to_bottom_on_output = config.@"scroll-to-bottom".output,
                     .custom_shader_animation = config.@"custom-shader-animation",
+                    .pixel_scroll = config.@"pixel-scroll",
+                    .scroll_animation_duration = config.@"scroll-animation-duration",
                     .arena = arena,
                 };
             }
@@ -1122,7 +1139,18 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 }
             }
 
-            if (shader_delay) |s| return .{ .delay_ms = s, .kind = .draw };
+            // A smooth scroll in flight needs draws until it settles.
+            const scroll_delay: ?u64 = if (self.scroll_offset_px != 0)
+                draw_interval_ms
+            else
+                null;
+
+            const draw_delay: ?u64 = if (shader_delay) |s|
+                if (scroll_delay) |sc| @min(s, sc) else s
+            else
+                scroll_delay;
+
+            if (draw_delay) |d| return .{ .delay_ms = d, .kind = .draw };
 
             return null;
         }
@@ -1344,6 +1372,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 mouse: renderer.State.Mouse,
                 preedit: ?renderer.State.Preedit,
                 scrollbar: terminal.Scrollbar,
+                viewport_y: ?usize,
                 overlay_features: []const Overlay.Feature,
             };
 
@@ -1493,12 +1522,24 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     ) catch &.{};
                 };
 
+                // The absolute row of the viewport top. Comparing this
+                // between frames tells us how far we scrolled, which is
+                // what drives the smooth scroll animation.
+                const viewport_y: ?usize = vp: {
+                    if (!self.config.pixel_scroll) break :vp null;
+                    const pages = &state.terminal.screens.active.pages;
+                    const pin = pages.getTopLeft(.viewport);
+                    const pt = pages.pointFromPin(.screen, pin) orelse break :vp null;
+                    break :vp pt.screen.y;
+                };
+
                 break :critical .{
                     .links = links,
                     .mouse = state.mouse,
                     .preedit = preedit,
                     .scrollbar = scrollbar,
                     .overlay_features = overlay_features,
+                    .viewport_y = viewport_y,
                 };
             };
 
@@ -1506,6 +1547,37 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // within it. This must be done before anything reads the
             // render state (e.g. rebuildCells).
             self.terminal_state.endUpdate();
+
+            // Smooth scrolling: if the viewport moved since the last frame,
+            // start the grid off by the distance it moved, so content is
+            // drawn where the eye last saw it, and let the animation carry
+            // it the rest of the way.
+            if (self.config.pixel_scroll) scroll: {
+                const vp_y = critical.viewport_y orelse break :scroll;
+                defer self.scroll_viewport_y = vp_y;
+
+                const prev = self.scroll_viewport_y orelse break :scroll;
+                if (vp_y == prev) break :scroll;
+
+                const delta_rows: i64 = @as(i64, @intCast(vp_y)) - @as(i64, @intCast(prev));
+                const cell_height: f32 = @floatFromInt(self.grid_metrics.cell_height);
+                const offset: f32 = @as(f32, @floatFromInt(delta_rows)) * cell_height;
+
+                // Clamp to a single row. We only have the viewport's own
+                // rows to draw, so any offset leaves that much background
+                // showing at one edge; a row is a brief, small gap. Once
+                // we build overscan rows above and below the viewport this
+                // can open up to a full screen's worth.
+                //
+                // It also means a jump to the top of the scrollback lands
+                // rather than flying the whole way.
+                const max_px: f32 = cell_height;
+                self.scroll_offset_px = std.math.clamp(
+                    self.scroll_offset_px + offset,
+                    -max_px,
+                    max_px,
+                );
+            }
 
             // Outside the critical area we can update our links to contain
             // our regex results.
@@ -1814,6 +1886,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             try self.updateCustomShaderUniformsForFrame();
 
             // Setup our frame data
+            // Advance the smooth scroll animation and draw the grid at
+            // wherever it has got to.
+            self.stepScrollAnimation();
+            self.uniforms.projection_matrix = self.projectionMatrix(self.scroll_offset_px);
+
             try frame.uniforms.sync(&.{self.uniforms});
             try frame.cells_bg.sync(self.cells.bg_cells);
             const fg_count = try frame.cells.syncFromArrayLists(self.cells.fg_rows);
@@ -2207,9 +2284,53 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// Update uniforms that are based on the screen size.
         ///
         /// Caller must hold the draw mutex.
-        fn updateScreenSizeUniforms(self: *Self) void {
+        /// The projection matrix for the current screen size, translated
+        /// vertically by `y_offset` pixels. A positive offset draws the
+        /// grid lower; smooth scrolling uses this to land the grid
+        /// between rows instead of snapping to one.
+        fn projectionMatrix(self: *const Self, y_offset: f32) math.Mat {
             const terminal_size = self.size.terminal();
+            return math.ortho2d(
+                -1 * @as(f32, @floatFromInt(self.size.padding.left)),
+                @floatFromInt(terminal_size.width + self.size.padding.right),
+                @as(f32, @floatFromInt(terminal_size.height + self.size.padding.bottom)) - y_offset,
+                (-1 * @as(f32, @floatFromInt(self.size.padding.top))) - y_offset,
+            );
+        }
 
+        /// Advance the smooth scroll animation toward rest. Called once per
+        /// draw and driven by wall time, so the motion is the same however
+        /// fast we're drawing.
+        fn stepScrollAnimation(self: *Self) void {
+            const now: std.Io.Timestamp = .now(global.io(), .awake);
+            defer self.scroll_clock = now;
+
+            if (self.scroll_offset_px == 0) return;
+
+            const duration = self.config.scroll_animation_duration;
+            if (!self.config.pixel_scroll or duration <= 0) {
+                self.scroll_offset_px = 0;
+                return;
+            }
+
+            const last = self.scroll_clock orelse return;
+            const dt_ns = last.durationTo(now).nanoseconds;
+            if (dt_ns <= 0) return;
+            const dt: f32 = @floatCast(
+                @as(f64, @floatFromInt(dt_ns)) / @as(f64, std.time.ns_per_s),
+            );
+
+            // Exponential decay with a time constant of a quarter of the
+            // configured duration, which puts us within a pixel of rest
+            // at roughly `duration`.
+            self.scroll_offset_px *= @exp(-dt / (duration / 4.0));
+
+            // Snap once we're within half a pixel. Without this the offset
+            // only approaches zero and we'd request redraws forever.
+            if (@abs(self.scroll_offset_px) < 0.5) self.scroll_offset_px = 0;
+        }
+
+        fn updateScreenSizeUniforms(self: *Self) void {
             // Blank space around the grid.
             const blank: renderer.Padding = self.size.screen.blankPadding(
                 self.size.padding,
@@ -2224,12 +2345,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             ).add(self.size.padding);
 
             // Setup our uniforms
-            self.uniforms.projection_matrix = math.ortho2d(
-                -1 * @as(f32, @floatFromInt(self.size.padding.left)),
-                @floatFromInt(terminal_size.width + self.size.padding.right),
-                @floatFromInt(terminal_size.height + self.size.padding.bottom),
-                -1 * @as(f32, @floatFromInt(self.size.padding.top)),
-            );
+            self.uniforms.projection_matrix = self.projectionMatrix(self.scroll_offset_px);
             self.uniforms.grid_padding = .{
                 @floatFromInt(blank.top),
                 @floatFromInt(blank.right),

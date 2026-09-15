@@ -1,0 +1,67 @@
+name: Build macOS (pixel-scroll, unsigned)
+
+# Builds an unsigned Ghostty.app with the pixel-scroll changes. GitHub's
+# macOS runners ship Xcode, which is the only reason this exists: the
+# machine this branch is developed on has Command Line Tools only, so the
+# app itself can only be built here.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [pixel-scroll]
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Use the newest installed Xcode
+        run: |
+          set -e
+          newest="$(ls -d /Applications/Xcode_*.app 2>/dev/null | sort -V | tail -1 || true)"
+          if [ -n "$newest" ]; then sudo xcode-select -s "$newest"; fi
+          xcodebuild -version
+          sw_vers
+
+      - name: Install Zig
+        run: |
+          set -e
+          ZIG_VERSION="$(grep -o 'minimum_zig_version = "[^"]*"' build.zig.zon | cut -d'"' -f2)"
+          echo "Using Zig $ZIG_VERSION"
+          curl -sL -o zig.tar.xz "https://ziglang.org/download/${ZIG_VERSION}/zig-aarch64-macos-${ZIG_VERSION}.tar.xz"
+          tar xf zig.tar.xz
+          echo "$PWD/zig-aarch64-macos-${ZIG_VERSION}" >> "$GITHUB_PATH"
+
+      - name: Zig version
+        run: zig version
+
+      # GhosttyKit is the Zig side, consumed by the Xcode project.
+      - name: Build GhosttyKit
+        run: zig build -Demit-macos-app=false -Doptimize=ReleaseFast -Dxcframework-target=native
+
+      # Built with Xcode tooling and ad-hoc signed: no Developer ID here,
+      # so the download needs its quarantine bit stripped before it runs.
+      - name: Build Ghostty.app
+        working-directory: macos
+        run: |
+          xcodebuild -target Ghostty -configuration Release \
+            CODE_SIGN_IDENTITY="-" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            -derivedDataPath "$RUNNER_TEMP/DerivedData"
+
+      - name: Package
+        run: |
+          set -e
+          APP="$(find "$RUNNER_TEMP/DerivedData" -name 'Ghostty.app' -maxdepth 4 -type d | head -1)"
+          if [ -z "$APP" ]; then echo "Ghostty.app not found"; exit 1; fi
+          echo "Found: $APP"
+          codesign --force --deep --sign - "$APP"
+          ditto -c -k --keepParent "$APP" ghostty-macos-pixel-scroll.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ghostty-macos-pixel-scroll
+          path: ghostty-macos-pixel-scroll.zip
+          if-no-files-found: error

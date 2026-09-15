@@ -1001,6 +1001,23 @@ palette: Palette = .{},
 /// The default value is "3" for discrete devices and "1" for precision devices.
 @"mouse-scroll-multiplier": MouseScrollMultiplier = .default,
 
+/// Smoothly animate the viewport when it scrolls, instead of jumping a
+/// whole cell at a time. The grid is drawn at a sub-cell vertical offset
+/// which decays to zero over `scroll-animation-duration`, so scrolling
+/// reads as continuous motion rather than a series of row jumps.
+///
+/// This applies to every source of scrolling: the mouse wheel, a
+/// touchpad, keybindings, and output scrolling the screen.
+@"pixel-scroll": bool = true,
+
+/// How long the scroll animation takes to settle, in seconds. Lower is
+/// snappier, higher is floatier. Has no effect if `pixel-scroll` is
+/// false.
+///
+/// A value of 0 disables the animation (equivalent to `pixel-scroll =
+/// false`). Values above 1 second are clamped.
+@"scroll-animation-duration": f32 = 0.12,
+
 /// The opacity level (opposite of transparency) of the background. A value of
 /// 1 is fully opaque and a value of 0 is fully transparent. A value less than 0
 /// or greater than 1 will be clamped to the nearest valid value.
@@ -4843,6 +4860,9 @@ pub fn finalize(self: *Config) !void {
     // Clamp our mouse scroll multiplier
     self.@"mouse-scroll-multiplier".precision = @min(10_000.0, @max(0.01, self.@"mouse-scroll-multiplier".precision));
     self.@"mouse-scroll-multiplier".discrete = @min(10_000.0, @max(0.01, self.@"mouse-scroll-multiplier".discrete));
+
+    // Clamp the scroll animation duration to something sane.
+    self.@"scroll-animation-duration" = @min(1.0, @max(0.0, self.@"scroll-animation-duration"));
 
     // Clamp our split opacity
     self.@"unfocused-split-opacity" = @min(1.0, @max(0.15, self.@"unfocused-split-opacity"));
