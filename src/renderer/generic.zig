@@ -3058,27 +3058,38 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     const ch: f32 = @floatFromInt(self.grid_metrics.cell_height);
 
                     // A cursor that held its row on screen while the
-                    // terminal scrolled under it was carried by the
-                    // grid: it is riding the line it sits on, which is
-                    // already gliding, so it travels in one piece and
-                    // over the same time rather than striking out on
-                    // its own and stretching. Output at the bottom of
-                    // the screen does this on every line.
-                    if (dx == 0 and pos.screen_y == prev.screen_y) {
+                    // terminal scrolled under it was carried by the grid:
+                    // it is riding the line it sits on, which is already
+                    // gliding, so that part of the journey travels in one
+                    // piece and over the grid's own time. Output at the
+                    // bottom of the screen does this on every line, and
+                    // running it at the cursor's pace instead made the
+                    // cursor arrive early and sag below its line — which
+                    // is what a command's output looked like.
+                    //
+                    // Whatever the cursor did on top of that is its own
+                    // move and animates as one, which is why this is split
+                    // rather than chosen between: hitting return after a
+                    // command both rides the scroll down and steps back to
+                    // the start of the line.
+                    const carried: bool = pos.screen_y == prev.screen_y;
+                    if (carried and dy != 0) {
                         self.cursor_corners.follow(
-                            0,
                             @floatFromInt(dy),
-                            cw,
                             ch,
                             if (self.config.pixel_scroll)
                                 self.config.scroll_animation_duration
                             else
                                 self.config.cursor_animation_duration,
                         );
-                    } else {
+                    }
+
+                    const own_x: i64 = dx;
+                    const own_y: i64 = if (carried) 0 else dy;
+                    if (own_x != 0 or own_y != 0) {
                         self.cursor_corners.move(
-                            @floatFromInt(dx),
-                            @floatFromInt(dy),
+                            @floatFromInt(own_x),
+                            @floatFromInt(own_y),
                             cw,
                             ch,
                             self.config.cursor_animation_duration,

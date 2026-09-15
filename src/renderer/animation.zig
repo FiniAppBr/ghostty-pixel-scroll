@@ -152,24 +152,29 @@ pub const CornerCursor = struct {
         y: Spring = .{},
 
         /// How long this corner has to arrive, set per move from its rank.
-        length: f32 = default_length,
+        /// The two axes are timed separately because they can be driven by
+        /// different things at once: a cursor riding a scroll downwards
+        /// while stepping left keeps the grid's pace vertically and its own
+        /// horizontally.
+        length_x: f32 = default_length,
+        length_y: f32 = default_length,
     };
 
     corners: [4]Corner = @splat(.{}),
 
-    /// Carry the cursor `cells_x`, `cells_y` cells — positive is right and
-    /// down — in one piece, every corner travelling together over
-    /// `duration`.
+    /// Carry the cursor down (or up) `cells` cells in one piece, every
+    /// corner travelling together over `duration`.
     ///
-    /// This is for a cursor that the grid moved rather than one that moved
-    /// itself: scrolling slides the cursor along with the text it sits on,
-    /// and text does not stretch. Pass the duration the grid is scrolling
-    /// over, so the two keep step.
+    /// This is for a cursor the grid moved rather than one that moved
+    /// itself. When output scrolls the screen the cursor keeps its place on
+    /// it and the grid slides underneath: the two cancel, and the cursor
+    /// looks still, which is right. They only cancel if they take the same
+    /// time, though, so pass the scroll's duration — timing this at the
+    /// cursor's own pace lets it arrive first and sag below the line it
+    /// belongs to while the text catches up.
     pub fn follow(
         self: *CornerCursor,
-        cells_x: f32,
-        cells_y: f32,
-        cell_width: f32,
+        cells: f32,
         cell_height: f32,
         duration: f32,
     ) void {
@@ -179,11 +184,10 @@ pub const CornerCursor = struct {
         }
 
         // Offsets are measured from where the cursor is going, so a move
-        // to the right leaves the corners sitting to the left of it.
+        // downwards leaves the corners sitting above it.
         for (&self.corners) |*c| {
-            c.x.add(-cells_x * cell_width);
-            c.y.add(-cells_y * cell_height);
-            c.length = duration;
+            c.y.add(-cells * cell_height);
+            c.length_y = duration;
         }
     }
 
@@ -242,11 +246,16 @@ pub const CornerCursor = struct {
                 if (a < alignment[i] or (a == alignment[i] and j < i)) rank += 1;
             }
 
-            c.length = switch (rank) {
+            const length: f32 = switch (rank) {
                 0 => trailing,
                 1 => (leading + trailing) / 2.0,
                 else => leading,
             };
+
+            // Only claim the axes this move actually travels on, so a step
+            // sideways doesn't retime a scroll the cursor is still riding.
+            if (cells_x != 0) c.length_x = length;
+            if (cells_y != 0) c.length_y = length;
         }
     }
 
@@ -257,8 +266,8 @@ pub const CornerCursor = struct {
 
         var moving = false;
         for (&self.corners) |*c| {
-            if (c.x.update(dt, c.length, zeta)) moving = true;
-            if (c.y.update(dt, c.length, zeta)) moving = true;
+            if (c.x.update(dt, c.length_x, zeta)) moving = true;
+            if (c.y.update(dt, c.length_y, zeta)) moving = true;
         }
         return moving;
     }
