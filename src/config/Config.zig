@@ -1014,9 +1014,17 @@ palette: Palette = .{},
 /// snappier, higher is floatier. Has no effect if `pixel-scroll` is
 /// false.
 ///
+/// The motion is a damped spring, so it eases in and out and a scroll
+/// part-way through another blends with it.
+///
 /// A value of 0 disables the animation (equivalent to `pixel-scroll =
 /// false`). Values above 1 second are clamped.
-@"scroll-animation-duration": f32 = 0.12,
+@"scroll-animation-duration": f32 = 0.3,
+
+/// How much the scroll animation overshoots and springs back, from 0 to
+/// 1. Zero is critically damped: it settles as fast as it can without
+/// ever overshooting. Higher values bounce.
+@"scroll-animation-bounciness": f32 = 0.0,
 
 /// Smoothly animate the cursor when it moves, instead of having it
 /// reappear at its new cell. The cursor is drawn at a sub-cell offset
@@ -1028,6 +1036,10 @@ palette: Palette = .{},
 /// A value of 0 disables the animation. Values above 1 second are
 /// clamped.
 @"cursor-animation-duration": f32 = 0.06,
+
+/// How much the cursor animation overshoots and springs back, from 0 to
+/// 1. Zero is critically damped. Higher values bounce.
+@"cursor-animation-bounciness": f32 = 0.0,
 
 /// The opacity level (opposite of transparency) of the background. A value of
 /// 1 is fully opaque and a value of 0 is fully transparent. A value less than 0
@@ -4875,6 +4887,8 @@ pub fn finalize(self: *Config) !void {
     // Clamp the scroll animation duration to something sane.
     self.@"scroll-animation-duration" = @min(1.0, @max(0.0, self.@"scroll-animation-duration"));
     self.@"cursor-animation-duration" = @min(1.0, @max(0.0, self.@"cursor-animation-duration"));
+    self.@"scroll-animation-bounciness" = @min(1.0, @max(0.0, self.@"scroll-animation-bounciness"));
+    self.@"cursor-animation-bounciness" = @min(1.0, @max(0.0, self.@"cursor-animation-bounciness"));
 
     // Clamp our split opacity
     self.@"unfocused-split-opacity" = @min(1.0, @max(0.15, self.@"unfocused-split-opacity"));

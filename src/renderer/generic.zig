@@ -14,6 +14,7 @@ const math = @import("../math.zig");
 const Surface = @import("../Surface.zig");
 const link = @import("link.zig");
 const cellpkg = @import("cell.zig");
+const animationpkg = @import("animation.zig");
 const noMinContrast = cellpkg.noMinContrast;
 const constraintWidth = cellpkg.constraintWidth;
 const isCovering = cellpkg.isCovering;
@@ -272,14 +273,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
         /// Smooth (pixel) scrolling state.
         ///
-        /// `scroll_offset_px` is the vertical offset, in pixels, that the
+        /// The spring's position is the vertical offset, in pixels, that the
         /// grid is currently drawn at. When the viewport moves down by a
         /// row the content would jump up by one cell; we instead start by
         /// drawing it one cell lower (a positive offset) and decay that to
         /// zero, so the motion reads as continuous. `scroll_viewport_y` is
         /// the absolute screen row of the viewport top as of the previous
         /// frame, which is how we detect that a scroll happened at all.
-        scroll_offset_px: f32 = 0,
+        scroll_spring: animationpkg.Spring = .{},
         scroll_viewport_y: ?usize = null,
         scroll_clock: ?std.Io.Timestamp = null,
 
@@ -289,10 +290,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// this to find real cursor motion.
         scroll_delta_rows: i64 = 0,
 
-        /// Smooth cursor motion state. `cursor_offset_px` is where the
+        /// Smooth cursor motion state. The springs hold where the
         /// cursor is drawn relative to the cell it now occupies: it starts
         /// at the cell it came from and decays to zero.
-        cursor_offset_px: [2]f32 = .{ 0, 0 },
+        cursor_spring_x: animationpkg.Spring = .{},
+        cursor_spring_y: animationpkg.Spring = .{},
         cursor_last_pos: ?[2]u16 = null,
         cursor_clock: ?std.Io.Timestamp = null,
 
@@ -626,6 +628,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             pixel_scroll: bool,
             scroll_animation_duration: f32,
             cursor_animation_duration: f32,
+            scroll_animation_bounciness: f32,
+            cursor_animation_bounciness: f32,
             custom_shader_animation: configpkg.CustomShaderAnimation,
 
             pub fn init(
@@ -705,6 +709,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .pixel_scroll = config.@"pixel-scroll",
                     .scroll_animation_duration = config.@"scroll-animation-duration",
                     .cursor_animation_duration = config.@"cursor-animation-duration",
+                    .scroll_animation_bounciness = config.@"scroll-animation-bounciness",
+                    .cursor_animation_bounciness = config.@"cursor-animation-bounciness",
                     .arena = arena,
                 };
             }
@@ -1155,9 +1161,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             }
 
             // A smooth scroll in flight needs draws until it settles.
-            const scroll_delay: ?u64 = if (self.scroll_offset_px != 0 or
-                self.cursor_offset_px[0] != 0 or
-                self.cursor_offset_px[1] != 0)
+            const scroll_delay: ?u64 = if (self.scroll_spring.active() or
+                self.cursor_spring_x.active() or
+                self.cursor_spring_y.active())
                 draw_interval_ms
             else
                 null;
@@ -1583,17 +1589,17 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 const cell_height: f32 = @floatFromInt(self.grid_metrics.cell_height);
                 const offset: f32 = @as(f32, @floatFromInt(delta_rows)) * cell_height;
 
-                // Clamp to a single row. We only have the viewport's own
-                // rows to draw, so any offset leaves that much background
-                // showing at one edge; a row is a brief, small gap. Once
-                // we build overscan rows above and below the viewport this
-                // can open up to a full screen's worth.
+                // Hand the distance to the spring, which keeps whatever
+                // velocity it already had, so a scroll part-way through
+                // another blends with it instead of restarting.
                 //
-                // It also means a jump to the top of the scrollback lands
-                // rather than flying the whole way.
+                // Still clamped to a single row: we only draw the
+                // viewport's own rows, so a larger offset would leave
+                // background showing at an edge. Overscan rows lift this.
                 const max_px: f32 = cell_height;
-                self.scroll_offset_px = std.math.clamp(
-                    self.scroll_offset_px + offset,
+                self.scroll_spring.add(offset);
+                self.scroll_spring.position = std.math.clamp(
+                    self.scroll_spring.position,
                     -max_px,
                     max_px,
                 );
@@ -1908,10 +1914,15 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // Setup our frame data
             // Advance the smooth scroll animation and draw the grid at
             // wherever it has got to.
-            self.stepScrollAnimation();
-            self.stepCursorAnimation();
-            self.uniforms.cursor_offset = self.cursor_offset_px;
-            self.uniforms.projection_matrix = self.projectionMatrix(self.scroll_offset_px);
+            const dt = self.animationDelta();
+            self.stepScrollAnimation(dt);
+            self.stepCursorAnimation(dt);
+            self.uniforms.cursor_offset = .{
+                self.cursor_spring_x.position,
+                self.cursor_spring_y.position,
+            };
+            self.uniforms.projection_matrix =
+                self.projectionMatrix(self.scroll_spring.position);
 
             try frame.uniforms.sync(&.{self.uniforms});
             try frame.cells_bg.sync(self.cells.bg_cells);
@@ -2320,64 +2331,47 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             );
         }
 
-        /// Advance the smooth cursor animation toward rest. Same decay as
-        /// the scroll animation, on its own duration.
-        fn stepCursorAnimation(self: *Self) void {
-            const now: std.Io.Timestamp = .now(global.io(), .awake);
-            defer self.cursor_clock = now;
-
-            if (self.cursor_offset_px[0] == 0 and self.cursor_offset_px[1] == 0) return;
-
+        /// Advance the cursor spring. Driven by wall time, so the motion
+        /// is the same however fast we happen to be drawing.
+        fn stepCursorAnimation(self: *Self, dt: f32) void {
+            if (dt <= 0) return;
             const duration = self.config.cursor_animation_duration;
             if (duration <= 0) {
-                self.cursor_offset_px = .{ 0, 0 };
+                self.cursor_spring_x.reset();
+                self.cursor_spring_y.reset();
                 return;
             }
 
-            const last = self.cursor_clock orelse return;
-            const dt_ns = last.durationTo(now).nanoseconds;
-            if (dt_ns <= 0) return;
-            const dt: f32 = @floatCast(
-                @as(f64, @floatFromInt(dt_ns)) / @as(f64, std.time.ns_per_s),
-            );
-
-            const decay = @exp(-dt / (duration / 4.0));
-            for (&self.cursor_offset_px) |*v| {
-                v.* *= decay;
-                if (@abs(v.*) < 0.5) v.* = 0;
-            }
+            // Bounciness lowers the damping ratio: 0 is critically damped,
+            // 1 is loose enough to overshoot and spring back.
+            const zeta = 1.0 - self.config.cursor_animation_bounciness * 0.7;
+            _ = self.cursor_spring_x.update(dt, duration, zeta);
+            _ = self.cursor_spring_y.update(dt, duration, zeta);
         }
 
-        /// Advance the smooth scroll animation toward rest. Called once per
-        /// draw and driven by wall time, so the motion is the same however
-        /// fast we're drawing.
-        fn stepScrollAnimation(self: *Self) void {
-            const now: std.Io.Timestamp = .now(global.io(), .awake);
-            defer self.scroll_clock = now;
-
-            if (self.scroll_offset_px == 0) return;
-
+        /// Advance the scroll spring.
+        fn stepScrollAnimation(self: *Self, dt: f32) void {
+            if (dt <= 0) return;
             const duration = self.config.scroll_animation_duration;
             if (!self.config.pixel_scroll or duration <= 0) {
-                self.scroll_offset_px = 0;
+                self.scroll_spring.reset();
                 return;
             }
 
-            const last = self.scroll_clock orelse return;
+            const zeta = 1.0 - self.config.scroll_animation_bounciness * 0.7;
+            _ = self.scroll_spring.update(dt, duration, zeta);
+        }
+
+        /// Seconds since the last draw, for the animations to step by.
+        fn animationDelta(self: *Self) f32 {
+            const now: std.Io.Timestamp = .now(global.io(), .awake);
+            defer self.scroll_clock = now;
+            const last = self.scroll_clock orelse return 0;
             const dt_ns = last.durationTo(now).nanoseconds;
-            if (dt_ns <= 0) return;
-            const dt: f32 = @floatCast(
+            if (dt_ns <= 0) return 0;
+            return @floatCast(
                 @as(f64, @floatFromInt(dt_ns)) / @as(f64, std.time.ns_per_s),
             );
-
-            // Exponential decay with a time constant of a quarter of the
-            // configured duration, which puts us within a pixel of rest
-            // at roughly `duration`.
-            self.scroll_offset_px *= @exp(-dt / (duration / 4.0));
-
-            // Snap once we're within half a pixel. Without this the offset
-            // only approaches zero and we'd request redraws forever.
-            if (@abs(self.scroll_offset_px) < 0.5) self.scroll_offset_px = 0;
         }
 
         fn updateScreenSizeUniforms(self: *Self) void {
@@ -2395,7 +2389,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             ).add(self.size.padding);
 
             // Setup our uniforms
-            self.uniforms.projection_matrix = self.projectionMatrix(self.scroll_offset_px);
+            self.uniforms.projection_matrix = self.projectionMatrix(self.scroll_spring.position);
             self.uniforms.grid_padding = .{
                 @floatFromInt(blank.top),
                 @floatFromInt(blank.right),
@@ -2871,7 +2865,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     std.math.maxInt(u16),
                 };
                 self.cursor_last_pos = null;
-                self.cursor_offset_px = .{ 0, 0 };
+                self.cursor_spring_x.reset();
+                self.cursor_spring_y.reset();
 
                 // If the cursor isn't visible on the viewport, don't show
                 // a cursor. Otherwise, get our cursor cell, because we may
@@ -2972,10 +2967,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
                         const cw: f32 = @floatFromInt(self.grid_metrics.cell_width);
                         const ch: f32 = @floatFromInt(self.grid_metrics.cell_height);
-                        self.cursor_offset_px = .{
-                            self.cursor_offset_px[0] + @as(f32, @floatFromInt(dx)) * cw,
-                            self.cursor_offset_px[1] + @as(f32, @floatFromInt(dy)) * ch,
-                        };
+                        self.cursor_spring_x.add(@as(f32, @floatFromInt(dx)) * cw);
+                        self.cursor_spring_y.add(@as(f32, @floatFromInt(dy)) * ch);
                     }
 
                     self.uniforms.bools.cursor_wide = switch (wide) {
