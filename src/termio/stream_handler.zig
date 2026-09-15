@@ -206,28 +206,60 @@ pub const StreamHandler = struct {
         //
         // ref: https://github.com/qwerasd205/asciinema-stats
 
-        // Reconcile local echo predictions against what actually came
-        // back. A plain print either confirms the oldest prediction or
-        // proves it wrong; anything else moves the cursor in ways no
-        // prediction survives, so they are all abandoned. `action` is
-        // comptime, so this is one branch at each call site rather than a
-        // switch, and the length check makes it a load and a branch when
-        // nothing is predicted.
+        // Reconcile local echo predictions against what the far end
+        // actually put on screen, and where.
+        //
+        // This used to match the byte stream in order and abandon
+        // everything on any action that was not a print. That does not
+        // survive contact with a program that repaints instead of echoing:
+        // a captured Claude Code session answers a single keystroke with
+        // six cursor moves before the character itself, so the queue was
+        // always empty by the time the echo arrived, no confirmation ever
+        // counted, and the engine never earned the right to draw. Matching
+        // on the cell instead makes a repaint's wandering irrelevant.
+        //
+        // This runs before the action is applied, so the cursor is still
+        // on the cell the character is about to occupy. `action` is
+        // comptime, so this is one branch at each call site, and the
+        // length check makes it a load and a branch when nothing is
+        // predicted.
         {
             const pred = &self.renderer_state.prediction;
             if (pred.len > 0) switch (action) {
-                .print => _ = pred.echoed(value.cp),
-                // printSlice carries u32s. Anything that does not narrow
-                // to a codepoint is not something we could have typed,
-                // so stop trusting what is on screen rather than guess.
-                .print_slice => for (value.cps) |cp| {
-                    const narrow = std.math.cast(u21, cp) orelse {
-                        pred.flush();
-                        break;
-                    };
-                    _ = pred.echoed(narrow);
+                .print => {
+                    const c = self.terminal.screens.active.cursor;
+                    _ = pred.printed(value.cp, @intCast(c.x), @intCast(c.y));
                 },
-                else => pred.flush(),
+                // printSlice carries u32s. Anything that does not narrow
+                // to a codepoint is not something we could have typed, so
+                // stop rather than guess at where the rest landed.
+                .print_slice => {
+                    const c = self.terminal.screens.active.cursor;
+                    var x: u16 = @intCast(c.x);
+                    for (value.cps) |cp| {
+                        const narrow = std.math.cast(u21, cp) orelse break;
+                        _ = pred.printed(narrow, x, @intCast(c.y));
+                        x +%= 1;
+                    }
+                },
+
+                // Only what actually moves text out from under a
+                // prediction. A repaint's cursor moves, mode changes and
+                // colour changes say nothing about a cell we claimed, and
+                // flushing on those is what stopped this working inside a
+                // full-screen program at all. Anything missed here is
+                // caught by the timeout.
+                .erase_display_below,
+                .erase_display_above,
+                .erase_display_complete,
+                .erase_display_scrollback,
+                .erase_display_scroll_complete,
+                .scroll_up,
+                .scroll_down,
+                .linefeed,
+                => pred.flush(),
+
+                else => {},
             };
         }
 

@@ -170,20 +170,47 @@ pub const Engine = struct {
     }
 
     /// A printable codepoint arrived from the far end.
-    pub fn echoed(self: *Engine, cp: u21) Outcome {
+    /// Reconcile against a character the far end actually printed, and
+    /// where it printed it.
+    ///
+    /// Matching on position rather than on order is the whole point. A
+    /// full-screen program does not echo: it repaints, walking the cursor
+    /// all over the screen on its way to the cell it is updating. Matching
+    /// a queue against the byte stream in order meant every one of those
+    /// moves looked like a surprise, so predictions were abandoned before
+    /// the echo could arrive and the engine never earned the right to draw
+    /// anything at all. A cell, on the other hand, either ends up holding
+    /// what we said it would or it does not.
+    ///
+    /// Measured against a real Claude Code session: typing one character
+    /// comes back as
+    ///
+    ///     ESC[?25l ESC[7D ESC[3B CR ESC[7C ESC[3A x CRLF CRLF CRLF ...
+    ///
+    /// Six cursor moves before the character, and the character lands on
+    /// exactly the cell the cursor was on when it was typed.
+    pub fn printed(self: *Engine, cp: u21, x: u16, y: u16) Outcome {
         if (self.len == 0) return .ignored;
 
-        if (self.entries[0].cp != cp) {
-            // What came back is not what we typed. Either we mispredicted
-            // or the far end is doing something of its own; either way
-            // what is on screen cannot be trusted.
+        // Everything written to a cell we never claimed is the program
+        // going about its business, and says nothing either way.
+        const hit: usize = for (self.entries[0..self.len], 0..) |e, i| {
+            if (e.x == x and e.y == y) break i;
+        } else return .ignored;
+
+        if (self.entries[hit].cp != cp) {
+            // A cell we claimed came back holding something else, so what
+            // is on screen cannot be trusted.
             self.demote(.observing);
             return .mismatch;
         }
 
-        // Confirmed: drop it from the front.
-        self.len -= 1;
-        for (0..self.len) |i| self.entries[i] = self.entries[i + 1];
+        // Confirmed. Anything predicted before it has been overtaken: the
+        // far end has reached this cell, so the cells before it are
+        // settled whether or not we watched each one land.
+        const drop = hit + 1;
+        self.len -= drop;
+        for (0..self.len) |i| self.entries[i] = self.entries[i + drop];
 
         switch (self.epoch) {
             // Seeing echo at all is what brings us back from a password
@@ -277,7 +304,7 @@ fn warmUp(e: *Engine, now: f32) void {
     var i: usize = 0;
     while (i < e.config.confirm_threshold) : (i += 1) {
         _ = e.typed('a', 0, 0, 80, now);
-        _ = e.echoed('a');
+        _ = e.printed('a', 0, 0);
     }
 }
 
@@ -356,7 +383,7 @@ test "a confirmed prediction leaves the queue" {
     warmUp(&e, 0);
 
     _ = e.typed('x', 5, 2, 80, 0);
-    try std.testing.expectEqual(Outcome.confirmed, e.echoed('x'));
+    try std.testing.expectEqual(Outcome.confirmed, e.printed('x', 5, 2));
     try std.testing.expectEqual(@as(usize, 0), e.len);
     try std.testing.expect(!e.hasDrawn());
 }
@@ -369,7 +396,7 @@ test "a mismatch drops everything and stops predicting" {
     _ = e.typed('y', 6, 2, 80, 0);
 
     // The far end sent something else entirely.
-    try std.testing.expectEqual(Outcome.mismatch, e.echoed('z'));
+    try std.testing.expectEqual(Outcome.mismatch, e.printed('z', 5, 2));
     try std.testing.expectEqual(@as(usize, 0), e.len);
     try std.testing.expectEqual(Epoch.observing, e.epoch);
 }
@@ -409,7 +436,7 @@ test "echo returning ends the silence but does not resume drawing at once" {
 
     // Past the prompt, the shell echoes again.
     _ = e.typed('l', 0, 0, 80, 2.0);
-    try std.testing.expectEqual(Outcome.confirmed, e.echoed('l'));
+    try std.testing.expectEqual(Outcome.confirmed, e.printed('l', 0, 0));
 
     // Back to watching, not straight back to drawing: trust is re-earned.
     try std.testing.expectEqual(Epoch.observing, e.epoch);
@@ -452,7 +479,7 @@ test "an untracked margin character still confirms" {
     // Undrawn because of the margin, but still expected back, so echo
     // accounting does not desynchronise across a wrap.
     try std.testing.expect(!e.typed('x', 79, 0, 80, 0));
-    try std.testing.expectEqual(Outcome.confirmed, e.echoed('x'));
+    try std.testing.expectEqual(Outcome.confirmed, e.printed('x', 79, 0));
     try std.testing.expectEqual(@as(usize, 0), e.len);
 }
 
@@ -474,7 +501,7 @@ test "output arriving when nothing was typed is ignored" {
     warmUp(&e, 0);
 
     // A program writing on its own must not be mistaken for an echo.
-    try std.testing.expectEqual(Outcome.ignored, e.echoed('q'));
+    try std.testing.expectEqual(Outcome.ignored, e.printed('q', 40, 10));
     try std.testing.expectEqual(Epoch.predicting, e.epoch);
 }
 
@@ -487,8 +514,8 @@ test "confirmations are ordered" {
     _ = e.typed('c', 2, 0, 80, 0);
 
     // Echo arrives in the order it was typed.
-    try std.testing.expectEqual(Outcome.confirmed, e.echoed('a'));
-    try std.testing.expectEqual(Outcome.confirmed, e.echoed('b'));
+    try std.testing.expectEqual(Outcome.confirmed, e.printed('a', 0, 0));
+    try std.testing.expectEqual(Outcome.confirmed, e.printed('b', 1, 0));
     try std.testing.expectEqual(@as(usize, 1), e.len);
     try std.testing.expectEqual(@as(u21, 'c'), e.entries[0].cp);
 }
@@ -534,11 +561,75 @@ test "timeout does not fire while echoes keep arriving" {
     warmUp(&e, 0);
 
     _ = e.typed('a', 0, 0, 80, 1.0);
-    _ = e.echoed('a');
+    _ = e.printed('a', 0, 0);
     _ = e.typed('b', 1, 0, 80, 1.1);
 
     // The queue's oldest entry is recent even though the session is old.
     e.tick(1.15);
     try std.testing.expectEqual(Epoch.predicting, e.epoch);
     try std.testing.expect(e.hasDrawn());
+}
+
+test "a repaint writing other cells leaves a prediction standing" {
+    var e: Engine = .{};
+    warmUp(&e, 0);
+
+    // Typed into a full-screen program's input box at column 7.
+    try std.testing.expect(e.typed('x', 7, 5, 80, 0));
+
+    // The program repaints its box on the way there, touching cells that
+    // have nothing to do with us. Under the old stream-order matching
+    // every one of these abandoned the prediction, which is why nothing
+    // was ever drawn inside Claude Code.
+    try std.testing.expectEqual(Outcome.ignored, e.printed('h', 2, 5));
+    try std.testing.expectEqual(Outcome.ignored, e.printed('e', 3, 5));
+    try std.testing.expectEqual(Outcome.ignored, e.printed('>', 0, 5));
+    try std.testing.expectEqual(@as(usize, 1), e.len);
+    try std.testing.expect(e.hasDrawn());
+    try std.testing.expectEqual(Epoch.predicting, e.epoch);
+
+    // And then the character lands where we said it would.
+    try std.testing.expectEqual(Outcome.confirmed, e.printed('x', 7, 5));
+    try std.testing.expectEqual(@as(usize, 0), e.len);
+}
+
+test "a later cell confirming settles the ones before it" {
+    var e: Engine = .{};
+    warmUp(&e, 0);
+
+    _ = e.typed('a', 7, 5, 80, 0);
+    _ = e.typed('b', 8, 5, 80, 0);
+
+    // A repaint redraws the line in one go, so only the last cell is seen
+    // arriving. Reaching cell 8 means cell 7 is settled too.
+    try std.testing.expectEqual(Outcome.confirmed, e.printed('b', 8, 5));
+    try std.testing.expectEqual(@as(usize, 0), e.len);
+}
+
+test "a cell we claimed coming back wrong is still a mismatch" {
+    var e: Engine = .{};
+    warmUp(&e, 0);
+
+    _ = e.typed('x', 7, 5, 80, 0);
+
+    // Position matching must not weaken this: a wrong character in a cell
+    // we drew into is exactly the case worth catching.
+    try std.testing.expectEqual(Outcome.mismatch, e.printed('z', 7, 5));
+    try std.testing.expectEqual(@as(usize, 0), e.len);
+    try std.testing.expectEqual(Epoch.observing, e.epoch);
+}
+
+test "a password prompt is still silence, not a repaint" {
+    var e: Engine = .{};
+    warmUp(&e, 0);
+
+    // sudo echoes nothing for the typed character, but the program may
+    // still be drawing elsewhere. Neither is an echo, so the timeout has
+    // to fire and stop us drawing.
+    _ = e.typed('s', 7, 5, 80, 1.0);
+    try std.testing.expectEqual(Outcome.ignored, e.printed('*', 40, 1));
+    e.tick(1.0 + e.config.timeout + 0.01);
+
+    try std.testing.expectEqual(Epoch.silent, e.epoch);
+    try std.testing.expect(!e.hasDrawn());
 }
