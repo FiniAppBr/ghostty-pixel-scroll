@@ -14,6 +14,12 @@ on:
   push:
     branches: [pixel-scroll]
 
+# A newer push makes an in-flight build pointless; macOS minutes bill at
+# 10x so it's worth not paying for both.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: macos-latest
@@ -23,6 +29,33 @@ jobs:
       CI_LOG: ${{ github.workspace }}/../ci.log
     steps:
       - uses: actions/checkout@v5
+
+      # The Zig cache carries the compiled C/C++ dependencies, which change
+      # only when build.zig.zon does. Restore-keys let a run start from the
+      # previous build's cache and recompile just what changed.
+      - name: Cache Zig
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/zig
+            .zig-cache
+          key: zig-${{ runner.os }}-${{ hashFiles('build.zig.zon', 'build.zig') }}-${{ github.sha }}
+          restore-keys: |
+            zig-${{ runner.os }}-${{ hashFiles('build.zig.zon', 'build.zig') }}-
+            zig-${{ runner.os }}-
+
+      # Sparkle is resolved over SwiftPM every run, and Xcode 26 can reuse
+      # compiled Swift across runs given a CAS directory.
+      - name: Cache Xcode
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/Library/Caches/org.swift.swiftpm
+            ~/Library/Developer/Xcode/DerivedData/CompilationCache.noindex
+          key: xcode-${{ runner.os }}-${{ hashFiles('macos/Ghostty.xcodeproj/project.pbxproj') }}-${{ github.sha }}
+          restore-keys: |
+            xcode-${{ runner.os }}-${{ hashFiles('macos/Ghostty.xcodeproj/project.pbxproj') }}-
+            xcode-${{ runner.os }}-
 
       - name: Use the newest installed Xcode
         id: xcode
@@ -42,7 +75,7 @@ jobs:
         run: |
           set -eo pipefail
           {
-            echo "=== zig ==="
+            echo "=== zig === $(date -u +%T)"
             ZIG_VERSION="$(grep -o 'minimum_zig_version = "[^"]*"' build.zig.zon | cut -d'"' -f2)"
             echo "Using Zig $ZIG_VERSION"
             curl -sL -o zig.tar.xz "https://ziglang.org/download/${ZIG_VERSION}/zig-aarch64-macos-${ZIG_VERSION}.tar.xz"
@@ -57,7 +90,7 @@ jobs:
         run: |
           set -eo pipefail
           {
-            echo "=== GhosttyKit ==="
+            echo "=== GhosttyKit === $(date -u +%T)"
             zig build -Demit-macos-app=false -Doptimize=ReleaseFast -Dxcframework-target=native
           } 2>&1 | tee -a "$CI_LOG"
 
@@ -69,7 +102,7 @@ jobs:
         run: |
           set -eo pipefail
           {
-            echo "=== xcodebuild ==="
+            echo "=== xcodebuild === $(date -u +%T)"
             xcodebuild -list -project Ghostty.xcodeproj || true
             # -derivedDataPath requires -scheme (not -target), and
             # ReleaseLocal is the configuration upstream uses for unsigned
@@ -81,6 +114,9 @@ jobs:
             xcodebuild -scheme Ghostty -configuration ReleaseLocal \
               ARCHS=arm64 \
               ONLY_ACTIVE_ARCH=YES \
+              COMPILATION_CACHE_ENABLE_CACHING=YES \
+              COMPILATION_CACHE_CAS_PATH="$HOME/Library/Developer/Xcode/DerivedData/CompilationCache.noindex" \
+              COMPILATION_CACHE_KEEP_CAS_DIRECTORY=YES \
               CODE_SIGN_IDENTITY="-" \
               CODE_SIGNING_REQUIRED=NO \
               -derivedDataPath "$RUNNER_TEMP/DerivedData"
@@ -91,7 +127,7 @@ jobs:
         run: |
           set -eo pipefail
           {
-            echo "=== package ==="
+            echo "=== package === $(date -u +%T)"
             APP="$(find "$RUNNER_TEMP/DerivedData" -name 'Ghostty.app' -maxdepth 6 -type d | head -1)"
             if [ -z "$APP" ]; then echo "Ghostty.app not found"; exit 1; fi
             echo "Found: $APP"
