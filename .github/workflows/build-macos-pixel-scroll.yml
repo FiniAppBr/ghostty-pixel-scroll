@@ -153,7 +153,7 @@ jobs:
             ls -lh ghostty-macos-pixel-scroll.zip
           } 2>&1 | tee -a "$CI_LOG"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: success()
         with:
           name: ghostty-macos-pixel-scroll
