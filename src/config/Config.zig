@@ -1041,6 +1041,23 @@ palette: Palette = .{},
 /// 1. Zero is critically damped. Higher values bounce.
 @"cursor-animation-bounciness": f32 = 0.0,
 
+/// How many extra splits a new window opens with, side by side. 0 is a
+/// single terminal, as usual; 2 gives three across.
+///
+/// The splits are even, and each one runs `command` like any other split,
+/// so a window that opens on a remote host opens all of them on it.
+@"initial-splits": u8 = 0,
+
+/// How long text takes to fade in as it appears, in seconds. 0 disables the
+/// fade and text appears at once, as it does everywhere else.
+///
+/// Only text that is genuinely new fades: a line that grows to the right, as
+/// a program writes or streams output, fades in the characters it gained.
+/// Redrawing a line that is already there does not fade, so a full-screen
+/// program repainting itself is left alone rather than smeared, and neither
+/// does scrolling old content back into view.
+@"text-fade-duration": f32 = 0.0,
+
 /// The opacity level (opposite of transparency) of the background. A value of
 /// 1 is fully opaque and a value of 0 is fully transparent. A value less than 0
 /// or greater than 1 will be clamped to the nearest valid value.
@@ -4889,6 +4906,7 @@ pub fn finalize(self: *Config) !void {
     self.@"cursor-animation-duration" = @min(1.0, @max(0.0, self.@"cursor-animation-duration"));
     self.@"scroll-animation-bounciness" = @min(1.0, @max(0.0, self.@"scroll-animation-bounciness"));
     self.@"cursor-animation-bounciness" = @min(1.0, @max(0.0, self.@"cursor-animation-bounciness"));
+    self.@"text-fade-duration" = @min(2.0, @max(0.0, self.@"text-fade-duration"));
 
     // Clamp our split opacity
     self.@"unfocused-split-opacity" = @min(1.0, @max(0.15, self.@"unfocused-split-opacity"));

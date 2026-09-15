@@ -290,6 +290,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// corners sooner than the trailing ones, so it stretches between
         /// the two cells on the way.
         cursor_corners: animationpkg.CornerCursor = .{},
+
+        /// Text that has just appeared fades in rather than popping into
+        /// place. Rows remember how far their content reached, so a line
+        /// growing to the right — a program writing, or output streaming
+        /// in — fades in only the characters it gained, and a redraw of
+        /// what was already there is left alone.
+        text_fade: TextFade = .{},
         cursor_last_pos: ?CursorPos = null,
         cursor_clock: ?std.Io.Timestamp = null,
 
@@ -580,6 +587,97 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             }
         };
 
+        /// What each row of the grid gained since we last looked at it,
+        /// which is what fades in.
+        ///
+        /// Rows are keyed by their absolute position in the scrollback
+        /// rather than their place on screen, so that scrolling carries a
+        /// row's record along with its text instead of making every row on
+        /// screen look like it just changed.
+        const TextFade = struct {
+            const Row = struct {
+                /// How far along the row its text reached last time.
+                len: u16 = 0,
+
+                /// The span currently fading in, and when it started.
+                x0: u16 = 0,
+                x1: u16 = 0,
+                at: f32 = 0,
+
+                /// Whether we have a record for this row at all. A row we
+                /// have never seen is not the same as a row that was
+                /// empty: scrollback coming into view is old text and
+                /// should appear at once.
+                known: bool = false,
+            };
+
+            rows: std.ArrayList(Row) = .empty,
+
+            /// The absolute row that `rows[0]` describes.
+            base: i64 = 0,
+
+            /// One past the last absolute row that existed last frame.
+            /// Anything at or beyond this is text that did not exist
+            /// before, rather than text scrolled into view.
+            end: i64 = 0,
+
+            /// Seconds since the first fade, and when the last one ends.
+            clock: ?std.Io.Timestamp = null,
+            now: f32 = 0,
+            until: f32 = 0,
+
+            fn deinit(self: *TextFade, alloc: Allocator) void {
+                self.rows.deinit(alloc);
+            }
+
+            /// Move the records to follow the grid, which has just been
+            /// rebuilt starting at absolute row `base` and `rows` tall.
+            fn slide(
+                self: *TextFade,
+                alloc: Allocator,
+                base: i64,
+                rows: usize,
+            ) Allocator.Error!void {
+                if (self.rows.items.len != rows) {
+                    try self.rows.resize(alloc, rows);
+                    @memset(self.rows.items, .{});
+                    self.base = base;
+                    return;
+                }
+
+                const delta = base - self.base;
+                self.base = base;
+                if (delta == 0) return;
+
+                // Scrolled further than the grid is tall: nothing on
+                // screen is anything we have a record of.
+                const height: i64 = @intCast(rows);
+                if (delta >= height or -delta >= height) {
+                    @memset(self.rows.items, .{});
+                    return;
+                }
+
+                // A row at absolute A sat at index A - old base, and now
+                // sits that many rows further along.
+                const d: usize = @intCast(if (delta > 0) delta else -delta);
+                if (delta > 0) {
+                    std.mem.copyForwards(
+                        Row,
+                        self.rows.items[0 .. rows - d],
+                        self.rows.items[d..],
+                    );
+                    @memset(self.rows.items[rows - d ..], .{});
+                } else {
+                    std.mem.copyBackwards(
+                        Row,
+                        self.rows.items[d..],
+                        self.rows.items[0 .. rows - d],
+                    );
+                    @memset(self.rows.items[0..d], .{});
+                }
+            }
+        };
+
         /// Where the cursor was when we last drew it, which is what the
         /// next frame measures its movement against.
         ///
@@ -638,6 +736,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             pixel_scroll: bool,
             scroll_animation_duration: f32,
             cursor_animation_duration: f32,
+            text_fade_duration: f32,
             scroll_animation_bounciness: f32,
             cursor_animation_bounciness: f32,
             custom_shader_animation: configpkg.CustomShaderAnimation,
@@ -719,6 +818,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .pixel_scroll = config.@"pixel-scroll",
                     .scroll_animation_duration = config.@"scroll-animation-duration",
                     .cursor_animation_duration = config.@"cursor-animation-duration",
+                    .text_fade_duration = config.@"text-fade-duration",
                     .scroll_animation_bounciness = config.@"scroll-animation-bounciness",
                     .cursor_animation_bounciness = config.@"cursor-animation-bounciness",
                     .arena = arena,
@@ -863,6 +963,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // shaders. Those are freed with `releaseGpuResources`.
 
             if (self.overlay) |*overlay| overlay.deinit(self.alloc);
+            self.text_fade.deinit(self.alloc);
             self.terminal_state.deinit(self.alloc);
             if (self.search_selected_match) |*m| m.arena.deinit();
             if (self.search_matches) |*m| m.arena.deinit();
@@ -1176,6 +1277,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 draw_interval_ms
             else
                 null;
+
+            // Text fading in lives in the cell colors, so unlike the
+            // springs it needs the cells rebuilt, not merely redrawn.
+            if (self.config.text_fade_duration > 0 and
+                self.text_fade.now < self.text_fade.until)
+            {
+                return .{ .delay_ms = draw_interval_ms, .kind = .update };
+            }
 
             const draw_delay: ?u64 = if (shader_delay) |s|
                 if (scroll_delay) |sc| @min(s, sc) else s
@@ -2431,6 +2540,98 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             _ = self.scroll_spring.update(dt, duration, zeta);
         }
 
+        /// Seconds on the fade clock, which starts at the first frame
+        /// that asks for it.
+        fn fadeNow(self: *Self) f32 {
+            const now: std.Io.Timestamp = .now(global.io(), .awake);
+            const base = self.text_fade.clock orelse {
+                self.text_fade.clock = now;
+                return 0;
+            };
+
+            const ns = base.durationTo(now).nanoseconds;
+            if (ns <= 0) return 0;
+            return @floatCast(
+                @as(f64, @floatFromInt(ns)) / @as(f64, std.time.ns_per_s),
+            );
+        }
+
+        /// Note what a row gained since we last looked at it. Text that
+        /// extends a line is text that has just been written, and that is
+        /// what fades in; a line redrawn at the same length has not gained
+        /// anything, which is what keeps a full-screen program repainting
+        /// itself from dissolving every frame.
+        fn textFadeTrack(
+            self: *Self,
+            y: terminal.size.CellCountInt,
+            cells: *std.MultiArrayList(terminal.RenderState.Cell),
+            now: f32,
+        ) void {
+            if (y >= self.text_fade.rows.items.len) return;
+            const rec = &self.text_fade.rows.items[y];
+
+            const raws = cells.items(.raw);
+            var len: u16 = 0;
+            for (raws, 0..) |raw, x| {
+                if (raw.hasText()) len = @intCast(x + 1);
+            }
+
+            defer {
+                rec.len = len;
+                rec.known = true;
+            }
+
+            // A row with no record is either text the program has just
+            // written past where the screen used to end, or scrollback
+            // that has only now come into view. The first should fade in
+            // from nothing, the second should simply be there.
+            const start: u16 = if (rec.known)
+                rec.len
+            else if (self.text_fade.base + @as(i64, y) >= self.text_fade.end)
+                0
+            else
+                len;
+
+            if (len <= start) return;
+            rec.x0 = start;
+            rec.x1 = len;
+            rec.at = now;
+            self.text_fade.until = now + self.config.text_fade_duration;
+        }
+
+        /// Whether a row still has text on its way in, which means it has
+        /// to be rebuilt this frame for the fade to move.
+        fn textFadeActive(self: *const Self, y: terminal.size.CellCountInt) bool {
+            const dur = self.config.text_fade_duration;
+            if (dur <= 0) return false;
+            if (y >= self.text_fade.rows.items.len) return false;
+            const rec = self.text_fade.rows.items[y];
+            if (rec.x1 <= rec.x0) return false;
+            return self.text_fade.now - rec.at < dur;
+        }
+
+        /// How far in a cell has faded, 1 for text that is simply there.
+        fn textFadeAlpha(
+            self: *const Self,
+            y: terminal.size.CellCountInt,
+            x: usize,
+        ) f32 {
+            const dur = self.config.text_fade_duration;
+            if (dur <= 0) return 1;
+            if (y >= self.text_fade.rows.items.len) return 1;
+
+            const rec = self.text_fade.rows.items[y];
+            if (x < rec.x0 or x >= rec.x1) return 1;
+
+            const t = (self.text_fade.now - rec.at) / dur;
+            if (t >= 1) return 1;
+            if (t <= 0) return 0;
+
+            // Eased out: quick to become legible, unhurried to settle.
+            const remaining = 1 - t;
+            return 1 - remaining * remaining;
+        }
+
         /// Seconds since the last draw, for the animations to step by.
         fn animationDelta(self: *Self) f32 {
             const now: std.Io.Timestamp = .now(global.io(), .awake);
@@ -2892,6 +3093,26 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 };
             } else null;
 
+            // Text that has just been written fades in. The records are
+            // keyed by absolute row, so scrolling slides them along with
+            // the text instead of making every row look freshly written.
+            const fade_dur = self.config.text_fade_duration;
+            if (fade_dur > 0) fade: {
+                self.text_fade.now = self.fadeNow();
+                const vp_y = self.scroll_viewport_y orelse break :fade;
+                const base: i64 = @as(i64, @intCast(vp_y)) -
+                    @as(i64, @intCast(state.rows_above));
+                self.text_fade.slide(
+                    self.alloc,
+                    base,
+                    @intCast(state.rows),
+                ) catch {
+                    // The fade is decoration. If we cannot afford to
+                    // track it, go without rather than fail the frame.
+                    self.text_fade.rows.clearRetainingCapacity();
+                };
+            }
+
             for (
                 0..,
                 row_raws[0..row_len],
@@ -2902,16 +3123,25 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             ) |y_usize, row, *cells, *dirty, selection, *highlights| {
                 const y: terminal.size.CellCountInt = @intCast(y_usize);
 
+                // A row with text still fading in has to be rebuilt every
+                // frame, because the fade lives in the cell colors.
+                const fading = self.textFadeActive(y);
+
                 if (!rebuild) {
                     // Only rebuild if we are doing a full rebuild or this row is dirty.
-                    if (!dirty.*) continue;
+                    if (!dirty.* and !fading) continue;
 
                     // Clear the cells if the row is dirty
                     self.cells.clear(y);
                 }
 
                 // Unmark the dirty state in our render state.
+                const row_changed = rebuild or dirty.*;
                 dirty.* = false;
+
+                if (fade_dur > 0 and row_changed) {
+                    self.textFadeTrack(y, cells, self.text_fade.now);
+                }
 
                 self.rebuildRow(
                     y,
@@ -2929,6 +3159,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     log.warn("error building row y={} err={}", .{ y, err });
                     self.cells.clear(y);
                 };
+            }
+
+            // Everything on screen now exists, so next frame only rows
+            // past this are text that was written rather than scrolled to.
+            if (fade_dur > 0) {
+                self.text_fade.end = self.text_fade.base + @as(i64, @intCast(row_len));
             }
 
             // Setup our cursor rendering information.
@@ -3458,7 +3694,16 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 };
 
                 // Foreground alpha for this cell.
-                const alpha: u8 = if (style.flags.faint) self.config.faint_opacity else 255;
+                var alpha: u8 = if (style.flags.faint) self.config.faint_opacity else 255;
+
+                // Text that has just been written comes up out of the
+                // background rather than landing on it.
+                if (self.config.text_fade_duration > 0) {
+                    const fade = self.textFadeAlpha(y, x);
+                    if (fade < 1) alpha = @intFromFloat(@round(
+                        @as(f32, @floatFromInt(alpha)) * fade,
+                    ));
+                }
 
                 // Set the cell's background color.
                 {
