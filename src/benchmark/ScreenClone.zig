@@ -236,7 +236,7 @@ fn stepRenderLocked(ptr: *anyopaque) Benchmark.Error!void {
     for (0..50_000 * @as(u64, self.opts.loops)) |_| {
         // Forces a full rebuild because it thinks our screen changed
         state.screen = .alternate;
-        state.beginUpdate(alloc, &self.terminal) catch |err| {
+        state.beginUpdate(alloc, &self.terminal, .{}) catch |err| {
             log.warn("error cloning screen err={}", .{err});
             return error.BenchmarkFailed;
         };

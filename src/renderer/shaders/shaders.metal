@@ -25,6 +25,7 @@ struct Uniforms {
   bool use_linear_blending;
   bool use_linear_correction;
   float2 cursor_offset;
+  float grid_offset_y;
 };
 
 //-------------------------------------------------------------------
@@ -454,7 +455,11 @@ fragment float4 cell_bg_fragment(
   constant Uniforms& uniforms [[buffer(1)]],
   constant uchar4 *cells [[buffer(2)]]
 ) {
-  int2 grid_pos = int2(floor((in.position.xy - uniforms.grid_padding.wx) / uniforms.cell_size));
+  // The grid may be drawn part-way between rows while a scroll animates,
+  // so take that back off before working out which cell a pixel is in.
+  float2 grid_px = in.position.xy - uniforms.grid_padding.wx;
+  grid_px.y -= uniforms.grid_offset_y;
+  int2 grid_pos = int2(floor(grid_px / uniforms.cell_size));
 
   float4 bg = float4(0.0);
 

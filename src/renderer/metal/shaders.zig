@@ -262,6 +262,12 @@ pub const Uniforms = extern struct {
     /// place, where a vec2's 8-byte alignment pads predictably.
     cursor_offset: [2]f32 align(8) = .{ 0, 0 },
 
+    /// How far down the grid is drawn from its settled position, in
+    /// pixels. The vertices carry this through the projection matrix, but
+    /// the background shader maps screen pixels back to grid rows and has
+    /// to undo it.
+    grid_offset_y: f32 align(4) = 0,
+
 
     const PaddingExtend = packed struct(u8) {
         left: bool = false,

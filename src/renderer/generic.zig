@@ -284,18 +284,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         scroll_viewport_y: ?usize = null,
         scroll_clock: ?std.Io.Timestamp = null,
 
-        /// How far the viewport moved in the frame being built, in rows.
-        /// The cursor's viewport row changes when the viewport scrolls even
-        /// though the cursor hasn't moved, so cursor animation subtracts
-        /// this to find real cursor motion.
-        scroll_delta_rows: i64 = 0,
 
         /// Smooth cursor motion state. The springs hold where the
         /// cursor is drawn relative to the cell it now occupies: it starts
         /// at the cell it came from and decays to zero.
         cursor_spring_x: animationpkg.Spring = .{},
         cursor_spring_y: animationpkg.Spring = .{},
-        cursor_last_pos: ?[2]u16 = null,
+        cursor_last_pos: ?[2]i64 = null,
         cursor_clock: ?std.Io.Timestamp = null,
 
         const HighlightTag = enum(u8) {
@@ -1445,9 +1440,43 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // denormalization) is deferred to the endUpdate call
                 // outside of this critical section, keeping our lock
                 // hold time as short as possible.
+                // Smooth scrolling draws the grid part-way between rows,
+                // so it needs the row above what it is showing and the one
+                // below. It also lags the live viewport by however many
+                // whole rows it still has to travel, so a multi-row scroll
+                // animates the whole distance rather than the last row of
+                // it: the snapshot starts that far back and the remainder
+                // is drawn as a sub-cell offset.
+                const overscan: terminal.RenderState.Overscan = overscan: {
+                    if (!self.config.pixel_scroll) break :overscan .{};
+                    const ch: f32 = @floatFromInt(self.grid_metrics.cell_height);
+                    if (ch <= 0) break :overscan .{};
+
+                    // An absolute row sits at its settled position plus the
+                    // distance still to travel, so a positive distance needs
+                    // rows from above the viewport and a negative one needs
+                    // rows from below. One more of each covers the sub-cell
+                    // remainder at both edges.
+                    const rows = @floor(self.scroll_spring.position / ch);
+                    const above: usize = if (rows > 0)
+                        @intFromFloat(rows)
+                    else
+                        0;
+                    const below: usize = if (rows < 0)
+                        @intFromFloat(-rows)
+                    else
+                        0;
+
+                    break :overscan .{
+                        .above = above + 1,
+                        .extra = above + below + 2,
+                    };
+                };
+
                 try self.terminal_state.beginUpdate(
                     self.alloc,
                     state.terminal,
+                    overscan,
                 );
 
                 // If our terminal state is dirty at all we need to redo
@@ -1549,7 +1578,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // between frames tells us how far we scrolled, which is
                 // what drives the smooth scroll animation.
                 const viewport_y: ?usize = vp: {
-                    if (!self.config.pixel_scroll) break :vp null;
+                    if (!self.config.pixel_scroll and
+                        self.config.cursor_animation_duration <= 0) break :vp null;
                     const pages = &state.terminal.screens.active.pages;
                     const pin = pages.getTopLeft(.viewport);
                     const pt = pages.pointFromPin(.screen, pin) orelse break :vp null;
@@ -1571,21 +1601,20 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // render state (e.g. rebuildCells).
             self.terminal_state.endUpdate();
 
-            self.scroll_delta_rows = 0;
-
             // Smooth scrolling: if the viewport moved since the last frame,
             // start the grid off by the distance it moved, so content is
             // drawn where the eye last saw it, and let the animation carry
             // it the rest of the way.
-            if (self.config.pixel_scroll) scroll: {
+            scroll: {
                 const vp_y = critical.viewport_y orelse break :scroll;
-                defer self.scroll_viewport_y = vp_y;
+                const prev_vp = self.scroll_viewport_y;
+                self.scroll_viewport_y = vp_y;
 
-                const prev = self.scroll_viewport_y orelse break :scroll;
+                if (!self.config.pixel_scroll) break :scroll;
+                const prev = prev_vp orelse break :scroll;
                 if (vp_y == prev) break :scroll;
 
                 const delta_rows: i64 = @as(i64, @intCast(vp_y)) - @as(i64, @intCast(prev));
-                self.scroll_delta_rows = delta_rows;
                 const cell_height: f32 = @floatFromInt(self.grid_metrics.cell_height);
                 const offset: f32 = @as(f32, @floatFromInt(delta_rows)) * cell_height;
 
@@ -1593,10 +1622,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // velocity it already had, so a scroll part-way through
                 // another blends with it instead of restarting.
                 //
-                // Still clamped to a single row: we only draw the
-                // viewport's own rows, so a larger offset would leave
-                // background showing at an edge. Overscan rows lift this.
-                const max_px: f32 = cell_height;
+                // A jump of more than a screenful is a jump, not a
+                // journey: cap it so paging to the top of the scrollback
+                // lands rather than flying the whole way.
+                const max_px: f32 = cell_height *
+                    @as(f32, @floatFromInt(self.cells.size.rows));
                 self.scroll_spring.add(offset);
                 self.scroll_spring.position = std.math.clamp(
                     self.scroll_spring.position,
@@ -1921,8 +1951,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 self.cursor_spring_x.position,
                 self.cursor_spring_y.position,
             };
-            self.uniforms.projection_matrix =
-                self.projectionMatrix(self.scroll_spring.position);
+            const grid_offset = self.gridYOffset();
+            self.uniforms.grid_offset_y = grid_offset;
+            self.uniforms.projection_matrix = self.projectionMatrix(grid_offset);
 
             try frame.uniforms.sync(&.{self.uniforms});
             try frame.cells_bg.sync(self.cells.bg_cells);
@@ -2349,6 +2380,22 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             _ = self.cursor_spring_y.update(dt, duration, zeta);
         }
 
+        /// How far down to draw the grid, in pixels.
+        ///
+        /// The grid starts however many rows above the viewport the render
+        /// state managed to reach, so drawing it in its settled place means
+        /// shifting up by that much; the distance the scroll still has to
+        /// travel then shifts it back down. Falls out to simply:
+        ///
+        ///     distance - rows_above * cell_height
+        ///
+        fn gridYOffset(self: *const Self) f32 {
+            const above = self.terminal_state.rows_above;
+            if (above == 0) return self.scroll_spring.position;
+            const ch: f32 = @floatFromInt(self.grid_metrics.cell_height);
+            return self.scroll_spring.position - @as(f32, @floatFromInt(above)) * ch;
+        }
+
         /// Advance the scroll spring.
         fn stepScrollAnimation(self: *Self, dt: f32) void {
             if (dt <= 0) return;
@@ -2380,7 +2427,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 self.size.padding,
                 .{
                     .columns = self.cells.size.columns,
-                    .rows = self.cells.size.rows,
+                    // The grid carries overscan rows the user never sees;
+                    // padding is measured against the viewport itself.
+                    .rows = if (self.terminal_state.viewport_rows > 0)
+                        self.terminal_state.viewport_rows
+                    else
+                        self.cells.size.rows,
                 },
                 .{
                     .width = self.grid_metrics.cell_width,
@@ -2389,7 +2441,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             ).add(self.size.padding);
 
             // Setup our uniforms
-            self.uniforms.projection_matrix = self.projectionMatrix(self.scroll_spring.position);
+            self.uniforms.grid_offset_y = self.gridYOffset();
+            self.uniforms.projection_matrix = self.projectionMatrix(self.uniforms.grid_offset_y);
             self.uniforms.grid_padding = .{
                 @floatFromInt(blank.top),
                 @floatFromInt(blank.right),
@@ -2955,14 +3008,24 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     cursor_anim: {
                         if (self.config.cursor_animation_duration <= 0) break :cursor_anim;
 
-                        const pos: [2]u16 = .{ cursor_vp.x, @intCast(cursor_vp.y) };
+                        // Track the cursor's absolute row, not its row on
+                        // screen. The grid slides under it — both when the
+                        // viewport scrolls and when a scroll animation lags
+                        // the snapshot — and none of that is the cursor
+                        // moving. Absolute rows are immune to both, and the
+                        // scroll spring animates the content's own movement.
+                        const vp_y = self.scroll_viewport_y orelse break :cursor_anim;
+                        const abs_y: i64 = @as(i64, @intCast(vp_y)) -
+                            @as(i64, @intCast(self.terminal_state.rows_above)) +
+                            @as(i64, @intCast(cursor_vp.y));
+
+                        const pos: [2]i64 = .{ @intCast(cursor_vp.x), abs_y };
                         defer self.cursor_last_pos = pos;
 
                         const prev = self.cursor_last_pos orelse break :cursor_anim;
 
-                        const dx: i64 = @as(i64, prev[0]) - @as(i64, pos[0]);
-                        const dy: i64 = (@as(i64, prev[1]) - @as(i64, pos[1])) -
-                            self.scroll_delta_rows;
+                        const dx: i64 = prev[0] - pos[0];
+                        const dy: i64 = prev[1] - pos[1];
                         if (dx == 0 and dy == 0) break :cursor_anim;
 
                         const cw: f32 = @floatFromInt(self.grid_metrics.cell_width);
@@ -3076,7 +3139,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 .background, .@"extend-always" => {},
 
                 // Apply heuristics for padding extension.
-                .extend => if (y == 0) {
+                .extend => if (y == self.terminal_state.rows_above) {
                     self.uniforms.padding_extend.up = !rowNeverExtendBg(
                         row,
                         cells_raw,
@@ -3084,7 +3147,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         &state.colors.palette,
                         state.colors.background,
                     );
-                } else if (y == self.cells.size.rows - 1) {
+                } else if (y + 1 == self.terminal_state.rows_above +
+                    self.terminal_state.viewport_rows)
+                {
                     self.uniforms.padding_extend.down = !rowNeverExtendBg(
                         row,
                         cells_raw,

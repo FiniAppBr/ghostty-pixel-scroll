@@ -70,6 +70,16 @@ const Terminal = @import("Terminal.zig");
 /// waste, it is recommended that the caller `deinit` and start with an
 /// empty render state every so often.
 pub const RenderState = struct {
+    /// How far beyond the viewport to build render state, for smooth
+    /// scrolling to slide into view.
+    pub const Overscan = struct {
+    /// Rows above the viewport to start at.
+    above: usize = 0,
+
+    /// Rows to build beyond the viewport's own height.
+    extra: usize = 0,
+    };
+
     /// The current screen dimensions. It is possible that these don't match
     /// the renderer's current dimensions in grid cells because resizing
     /// can happen asynchronously. For example, for Metal, our NSView resizes
@@ -109,6 +119,18 @@ pub const RenderState = struct {
     /// a tracked pin and is generally NOT safe to read other than the direct
     /// values for comparison.
     viewport_pin: ?PageList.Pin = null,
+
+    /// How many rows above the viewport this state actually starts at.
+    /// Smooth scrolling asks for rows beyond the viewport so it has
+    /// content to draw into the gap it opens; near the top of the
+    /// scrollback there may be fewer available than asked for, and the
+    /// renderer offsets by the difference.
+    rows_above: usize = 0,
+
+    /// The viewport's own height, without the rows built beyond it. Use
+    /// this wherever the size of what the user actually sees matters,
+    /// since `rows` includes the overscan.
+    viewport_rows: size.CellCountInt = 0,
 
     /// The cached selection so we can avoid expensive selection calculations
     /// if possible.
@@ -345,7 +367,7 @@ pub const RenderState = struct {
         alloc: Allocator,
         t: *Terminal,
     ) Allocator.Error!void {
-        try self.beginUpdate(alloc, t);
+        try self.beginUpdate(alloc, t, .{});
         self.endUpdate();
     }
 
@@ -374,9 +396,24 @@ pub const RenderState = struct {
         self: *RenderState,
         alloc: Allocator,
         t: *Terminal,
+        /// Start this many rows above the viewport, and build `extra` rows
+        /// more than the viewport holds. Smooth scrolling uses this to
+        /// render the rows either side of the viewport, which is what it
+        /// slides into view; zero gives exactly the viewport.
+        opts: Overscan,
     ) Allocator.Error!void {
         const s: *Screen = t.screens.active;
-        const viewport_pin = s.pages.getTopLeft(.viewport);
+
+        const live_pin = s.pages.getTopLeft(.viewport);
+        const viewport_pin, const rows_above = pin: {
+            if (opts.above == 0) break :pin .{ live_pin, 0 };
+            break :pin switch (live_pin.upOverflow(opts.above)) {
+                .offset => |p| .{ p, opts.above },
+                // Not enough scrollback above: take what there is and let
+                // the renderer account for the shortfall.
+                .overflow => |v| .{ v.end, opts.above - v.remaining },
+            };
+        };
         const redraw = redraw: {
             // If our screen key changed, we need to do a full rebuild
             // because our render state is viewport-specific.
@@ -399,7 +436,7 @@ pub const RenderState = struct {
             }
 
             // If our dimensions changed, we do a full rebuild.
-            if (self.rows != s.pages.rows or
+            if (self.rows != @as(usize, s.pages.rows) + opts.extra or
                 self.cols != s.pages.cols)
             {
                 break :redraw true;
@@ -414,7 +451,9 @@ pub const RenderState = struct {
         };
 
         // Always set our cheap fields, its more expensive to compare
-        self.rows = s.pages.rows;
+        self.rows = @intCast(@as(usize, s.pages.rows) + opts.extra);
+        self.viewport_rows = s.pages.rows;
+        self.rows_above = rows_above;
         self.cols = s.pages.cols;
         self.viewport_pin = viewport_pin;
         self.cursor.active = .{ .x = s.cursor.x, .y = s.cursor.y };
@@ -649,6 +688,18 @@ pub const RenderState = struct {
             }
 
             y += take;
+        }
+
+        // The rows we asked for beyond the viewport may not exist — at the
+        // bottom there is nothing below the last row. Leave those slots
+        // empty rather than short-changing the row count.
+        if (y < self.rows) {
+            const cells = row_data.items(.cells);
+            const dirties = row_data.items(.dirty);
+            while (y < self.rows) : (y += 1) {
+                cells[y].shrinkRetainingCapacity(0);
+                dirties[y] = false;
+            }
         }
         assert(y == self.rows);
 
