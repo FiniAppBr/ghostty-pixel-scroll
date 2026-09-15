@@ -40,6 +40,11 @@ pub const Key = enum {
 ///
 /// Must be initialized by resizing before calling any operations.
 pub const Contents = struct {
+    /// How many rows the GPU grid has beyond the viewport: one overscan row
+    /// above it and one below, which smooth scrolling draws into the gap it
+    /// opens at an edge.
+    pub const overscan_rows = 2;
+
     size: renderer.GridSize = .{ .rows = 0, .columns = 0 },
 
     /// Flat array containing cell background colors for the terminal grid.
@@ -88,9 +93,20 @@ pub const Contents = struct {
     ) Allocator.Error!void {
         const row_count: usize = size.rows;
 
-        // The two extra lists hold cursor cells: index 0 is drawn before the
-        // row contents, and index row_count + 1 is drawn after them.
-        const fg_rows = try alloc.alloc(CellTextRow, row_count + 2);
+        // Two extra lists hold cursor cells: index 0 is drawn before the row
+        // contents and the last is drawn after them. Two more hold the
+        // overscan rows, the rows just above and just below the viewport,
+        // which smooth scrolling draws into the gap it opens at an edge.
+        //
+        // The full layout is:
+        //
+        //     [0]              cursor, drawn first
+        //     [1]              overscan row above the viewport
+        //     [2 .. rows+1]    the viewport's own rows
+        //     [rows+2]         overscan row below the viewport
+        //     [rows+3]         cursor, drawn last
+        //
+        const fg_rows = try alloc.alloc(CellTextRow, row_count + 4);
         @memset(fg_rows, .empty);
         errdefer {
             for (fg_rows) |*row| row.deinit(alloc);
@@ -106,14 +122,16 @@ pub const Contents = struct {
 
         // The cursor lists need just one cell. The rest get the full capacity.
         fg_rows[0] = try .initCapacity(alloc, 1);
-        fg_rows[row_count + 1] = try .initCapacity(alloc, 1);
-        for (fg_rows[1 .. row_count + 1]) |*row| {
+        fg_rows[row_count + 3] = try .initCapacity(alloc, 1);
+        for (fg_rows[1 .. row_count + 3]) |*row| {
             row.* = try .initCapacity(alloc, fg_row_capacity);
         }
 
+        // The background cells carry the two overscan rows as well, so the
+        // GPU grid is two rows taller than the viewport.
         const bg_cells = try alloc.realloc(
             self.bg_cells,
-            row_count * @as(usize, size.columns),
+            (row_count + 2) * @as(usize, size.columns),
         );
 
         // Perform the swap, no going back from here.
@@ -140,16 +158,20 @@ pub const Contents = struct {
     ) void {
         if (self.size.rows == 0) return;
         self.fg_rows[0].clearRetainingCapacity();
-        self.fg_rows[self.size.rows + 1].clearRetainingCapacity();
+        self.fg_rows[self.size.rows + 3].clearRetainingCapacity();
 
-        const cell = v orelse return;
+        const cell_vp = v orelse return;
         const style = cursor_style orelse return;
+
+        // Callers work in viewport coordinates; shift into GPU rows.
+        var cell = cell_vp;
+        cell.grid_pos[1] = gpuRow(cell.grid_pos[1]);
 
         switch (style) {
             // Block cursors should be drawn first
             .block => self.fg_rows[0].appendAssumeCapacity(cell),
             // Other cursor styles should be drawn last
-            .block_hollow, .bar, .underline, .lock => self.fg_rows[self.size.rows + 1].appendAssumeCapacity(cell),
+            .block_hollow, .bar, .underline, .lock => self.fg_rows[self.size.rows + 3].appendAssumeCapacity(cell),
         }
     }
 
@@ -159,20 +181,92 @@ pub const Contents = struct {
         if (self.fg_rows[0].items.len > 0) {
             return self.fg_rows[0].items[0];
         }
-        if (self.fg_rows[self.size.rows + 1].items.len > 0) {
-            return self.fg_rows[self.size.rows + 1].items[0];
+        if (self.fg_rows[self.size.rows + 3].items.len > 0) {
+            return self.fg_rows[self.size.rows + 3].items[0];
         }
         return null;
     }
 
-    /// Access a background cell. Prefer this function over direct indexing
-    /// of `bg_cells` in order to avoid integer size bugs causing overflows.
+    /// The GPU grid carries an overscan row above the viewport, so GPU row
+    /// 0 is the row above viewport row 0. Everything outside this struct
+    /// works in viewport coordinates and is mapped through here.
+    inline fn gpuRow(y: anytype) @TypeOf(y) {
+        return y + 1;
+    }
+
+    /// The GPU row index of the overscan row below the viewport.
+    inline fn overscanBottomRow(self: *const Contents) usize {
+        return @as(usize, self.size.rows) + 1;
+    }
+
+    /// Access a background cell, in viewport coordinates. Prefer this
+    /// function over direct indexing of `bg_cells` in order to avoid
+    /// integer size bugs causing overflows.
     pub inline fn bgCell(
         self: *Contents,
         row: usize,
         col: usize,
     ) *shaderpkg.CellBg {
+        return &self.bg_cells[gpuRow(row) * self.size.columns + col];
+    }
+
+    /// Access a background cell in one of the overscan rows: the row just
+    /// above the viewport, or the one just below it.
+    pub inline fn overscanBgCell(
+        self: *Contents,
+        edge: Overscan,
+        col: usize,
+    ) *shaderpkg.CellBg {
+        const row: usize = switch (edge) {
+            .top => 0,
+            .bottom => self.overscanBottomRow(),
+        };
         return &self.bg_cells[row * self.size.columns + col];
+    }
+
+    /// Which overscan row an operation refers to.
+    pub const Overscan = enum { top, bottom };
+
+    /// Add a cell to one of the overscan rows. The cell's grid_pos y is
+    /// ignored; the edge decides where it lands.
+    pub fn addOverscan(
+        self: *Contents,
+        alloc: Allocator,
+        comptime key: Key,
+        edge: Overscan,
+        cell_in: key.CellType(),
+    ) Allocator.Error!void {
+        var cell = cell_in;
+        const list: usize, const row: u16 = switch (edge) {
+            .top => .{ 1, 0 },
+            .bottom => .{
+                @as(usize, self.size.rows) + 2,
+                @intCast(self.overscanBottomRow()),
+            },
+        };
+
+        switch (key) {
+            .bg => comptime unreachable,
+            .text,
+            .underline,
+            .strikethrough,
+            .overline,
+            => {
+                cell.grid_pos[1] = @intCast(row);
+                try self.fg_rows[list].append(alloc, cell);
+            },
+        }
+    }
+
+    /// Clear both overscan rows. Smooth scrolling refills them every frame
+    /// it needs them; when it doesn't, they must not linger on screen.
+    pub fn clearOverscan(self: *Contents) void {
+        const cols: usize = self.size.columns;
+        const bottom = self.overscanBottomRow();
+        @memset(self.bg_cells[0..cols], .{ 0, 0, 0, 0 });
+        @memset(self.bg_cells[bottom * cols ..][0..cols], .{ 0, 0, 0, 0 });
+        self.fg_rows[1].clearRetainingCapacity();
+        self.fg_rows[@as(usize, self.size.rows) + 2].clearRetainingCapacity();
     }
 
     /// Add a cell to the appropriate list. Adding the same cell twice will
@@ -182,11 +276,16 @@ pub const Contents = struct {
         self: *Contents,
         alloc: Allocator,
         comptime key: Key,
-        cell: key.CellType(),
+        cell_in: key.CellType(),
     ) Allocator.Error!void {
-        const y = cell.grid_pos[1];
+        const y = cell_in.grid_pos[1];
 
         assert(y < self.size.rows);
+
+        // Callers work in viewport coordinates; the GPU grid has the
+        // overscan row above the viewport at row 0.
+        var cell = cell_in;
+        cell.grid_pos[1] = gpuRow(y);
 
         switch (key) {
             .bg => comptime unreachable,
@@ -195,10 +294,9 @@ pub const Contents = struct {
             .underline,
             .strikethrough,
             .overline,
-            // We have a special list containing the cursor cell at the start
-            // of our fg row collection, so we need to add 1 to the y to get
-            // the correct index.
-            => try self.fg_rows[y + 1].append(alloc, cell),
+            // The fg lists lead with the cursor list and the top overscan
+            // row, so viewport row y is at y + 2.
+            => try self.fg_rows[y + 2].append(alloc, cell),
         }
     }
 
@@ -206,12 +304,14 @@ pub const Contents = struct {
     pub fn clear(self: *Contents, y: terminal.size.CellCountInt) void {
         assert(y < self.size.rows);
 
-        @memset(self.bg_cells[@as(usize, y) * self.size.columns ..][0..self.size.columns], .{ 0, 0, 0, 0 });
+        @memset(
+            self.bg_cells[gpuRow(@as(usize, y)) * self.size.columns ..][0..self.size.columns],
+            .{ 0, 0, 0, 0 },
+        );
 
-        // We have a special list containing the cursor cell at the start
-        // of our fg row collection, so we need to add 1 to the y to get
-        // the correct index.
-        self.fg_rows[y + 1].clearRetainingCapacity();
+        // The fg lists lead with the cursor list and the top overscan row,
+        // so viewport row y is at y + 2.
+        self.fg_rows[y + 2].clearRetainingCapacity();
     }
 };
 

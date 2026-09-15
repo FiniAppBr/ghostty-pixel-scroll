@@ -1889,7 +1889,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // Advance the smooth scroll animation and draw the grid at
             // wherever it has got to.
             self.stepScrollAnimation();
-            self.uniforms.projection_matrix = self.projectionMatrix(self.scroll_offset_px);
+            self.uniforms.projection_matrix = self.projectionMatrix(self.gridYOffset());
 
             try frame.uniforms.sync(&.{self.uniforms});
             try frame.cells_bg.sync(self.cells.bg_cells);
@@ -2298,6 +2298,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             );
         }
 
+        /// How far down to draw the grid, in pixels. The grid is drawn one
+        /// row higher than the viewport because GPU row 0 is the overscan
+        /// row above it; the scroll animation rides on top of that.
+        fn gridYOffset(self: *const Self) f32 {
+            const overscan: f32 = @floatFromInt(self.grid_metrics.cell_height);
+            return self.scroll_offset_px - overscan;
+        }
+
         /// Advance the smooth scroll animation toward rest. Called once per
         /// draw and driven by wall time, so the motion is the same however
         /// fast we're drawing.
@@ -2345,7 +2353,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             ).add(self.size.padding);
 
             // Setup our uniforms
-            self.uniforms.projection_matrix = self.projectionMatrix(self.scroll_offset_px);
+            self.uniforms.projection_matrix = self.projectionMatrix(self.gridYOffset());
             self.uniforms.grid_padding = .{
                 @floatFromInt(blank.top),
                 @floatFromInt(blank.right),
@@ -2702,7 +2710,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
                 // Update our uniforms accordingly, otherwise
                 // our background cells will be out of place.
-                self.uniforms.grid_size = .{ new_size.columns, new_size.rows };
+                // The GPU grid is two rows taller than the viewport: one
+                // overscan row above and one below, which smooth scrolling
+                // draws into the gap it opens at an edge.
+                self.uniforms.grid_size = .{
+                    new_size.columns,
+                    new_size.rows + cellpkg.Contents.overscan_rows,
+                };
             }
 
             const rebuild = state.dirty == .full or grid_size_diff;
@@ -2898,7 +2912,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                             .narrow, .spacer_head, .wide => cursor_vp.x,
                             .spacer_tail => cursor_vp.x -| 1,
                         },
-                        @intCast(cursor_vp.y),
+                        // The shader compares this against GPU rows, which
+                        // are offset by the top overscan row.
+                        @intCast(cursor_vp.y + 1),
                     };
 
                     self.uniforms.bools.cursor_wide = switch (wide) {
