@@ -197,13 +197,19 @@ pub const Uniforms = extern struct {
     /// Various booleans, in a packed struct for space efficiency.
     bools: Bools align(4),
 
-    /// Pixel offset applied to the cursor glyph only (instances with the
-    /// IS_CURSOR_GLYPH bit). Smooth cursor motion draws the cursor away
-    /// from its grid cell while it catches up.
+    /// Pixel offsets applied to the four corners of the cursor glyph only
+    /// (instances with the IS_CURSOR_GLYPH bit), in order: top-left,
+    /// top-right, bottom-right, bottom-left. Smooth cursor motion springs
+    /// each corner on its own, so the cursor stretches out of the cell it
+    /// left and gathers itself into the one it lands on.
     ///
-    /// Must stay the last field: the shader structs append it in the same
-    /// place, where a vec2's 8-byte alignment pads predictably.
-    cursor_offset: [2]f32 align(8) = .{ 0, 0 },
+    /// These stay together and ahead of `grid_offset_y`: the shader
+    /// structs list them in the same order, where a vec2's 8-byte
+    /// alignment pads predictably.
+    cursor_offset_tl: [2]f32 align(8) = .{ 0, 0 },
+    cursor_offset_tr: [2]f32 align(8) = .{ 0, 0 },
+    cursor_offset_br: [2]f32 align(8) = .{ 0, 0 },
+    cursor_offset_bl: [2]f32 align(8) = .{ 0, 0 },
 
     /// How far down the grid is drawn from its settled position, in
     /// pixels. The vertices carry this through the projection matrix, but
@@ -234,7 +240,6 @@ pub const Uniforms = extern struct {
 
         _padding: u28 = 0,
     };
-
 
     const PaddingExtend = packed struct(u32) {
         left: bool = false,

@@ -23,7 +23,10 @@ layout(binding = 1, std140) uniform Globals {
     uniform uint cursor_color_packed_4u8;
     uniform uint bg_color_packed_4u8;
     uniform uint bools;
-    uniform vec2 cursor_offset;
+    uniform vec2 cursor_offset_tl;
+    uniform vec2 cursor_offset_tr;
+    uniform vec2 cursor_offset_br;
+    uniform vec2 cursor_offset_bl;
     uniform float grid_offset_y;
 };
 

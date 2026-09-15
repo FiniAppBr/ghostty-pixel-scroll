@@ -284,13 +284,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         scroll_viewport_y: ?usize = null,
         scroll_clock: ?std.Io.Timestamp = null,
 
-
-        /// Smooth cursor motion state. The springs hold where the
-        /// cursor is drawn relative to the cell it now occupies: it starts
-        /// at the cell it came from and decays to zero.
-        cursor_spring_x: animationpkg.Spring = .{},
-        cursor_spring_y: animationpkg.Spring = .{},
-        cursor_last_pos: ?[2]i64 = null,
+        /// Smooth cursor motion state. Each corner of the cursor holds
+        /// its own offset from the cell the cursor now occupies: they
+        /// start at the cell it came from and decay to zero, the leading
+        /// corners sooner than the trailing ones, so it stretches between
+        /// the two cells on the way.
+        cursor_corners: animationpkg.CornerCursor = .{},
+        cursor_last_pos: ?CursorPos = null,
         cursor_clock: ?std.Io.Timestamp = null,
 
         const HighlightTag = enum(u8) {
@@ -578,6 +578,21 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 self.front_texture = front_texture;
                 self.back_texture = back_texture;
             }
+        };
+
+        /// Where the cursor was when we last drew it, which is what the
+        /// next frame measures its movement against.
+        ///
+        /// `x` and `y` place it in the content, which is the frame of
+        /// reference for a move: scrolling changes which row of the screen
+        /// a given line of text is on, and none of that is the cursor
+        /// moving. `screen_y` is that row, kept alongside so that the two
+        /// can be told apart — a cursor that held its place on screen
+        /// while the terminal scrolled was carried by the grid.
+        const CursorPos = struct {
+            x: i64,
+            y: i64,
+            screen_y: i64,
         };
 
         /// The configuration for this renderer that is derived from the main
@@ -1157,8 +1172,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             // A smooth scroll in flight needs draws until it settles.
             const scroll_delay: ?u64 = if (self.scroll_spring.active() or
-                self.cursor_spring_x.active() or
-                self.cursor_spring_y.active())
+                self.cursor_corners.active())
                 draw_interval_ms
             else
                 null;
@@ -1390,7 +1404,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 mouse: renderer.State.Mouse,
                 preedit: ?renderer.State.Preedit,
                 scrollbar: terminal.Scrollbar,
-                viewport_y: ?usize,
                 overlay_features: []const Overlay.Feature,
             };
 
@@ -1440,6 +1453,63 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // denormalization) is deferred to the endUpdate call
                 // outside of this critical section, keeping our lock
                 // hold time as short as possible.
+                // The absolute row of the viewport top. Comparing this
+                // between frames tells us how far we scrolled, which is
+                // what drives the smooth scroll animation.
+                //
+                // This has to happen before the render state update below,
+                // not after it: the snapshot is asked for exactly the rows
+                // this frame's animation slides into view, so the distance
+                // has to be known before it is built. Applying it a frame
+                // later left a fast scroll drawing rows that the snapshot
+                // was never asked for, which showed up as a band of blank
+                // rows at the start of a flick.
+                const viewport_y: ?usize = vp: {
+                    if (!self.config.pixel_scroll and
+                        self.config.cursor_animation_duration <= 0) break :vp null;
+                    const pages = &state.terminal.screens.active.pages;
+                    const pin = pages.getTopLeft(.viewport);
+                    const pt = pages.pointFromPin(.screen, pin) orelse break :vp null;
+                    break :vp pt.screen.y;
+                };
+
+                // Smooth scrolling: if the viewport moved since the last
+                // frame, start the grid off by the distance it moved, so
+                // content is drawn where the eye last saw it, and let the
+                // animation carry it the rest of the way.
+                scroll: {
+                    const vp_y = viewport_y orelse break :scroll;
+                    const prev_vp = self.scroll_viewport_y;
+                    self.scroll_viewport_y = vp_y;
+
+                    if (!self.config.pixel_scroll) break :scroll;
+                    const prev = prev_vp orelse break :scroll;
+                    if (vp_y == prev) break :scroll;
+
+                    const delta_rows: i64 = @as(i64, @intCast(vp_y)) - @as(i64, @intCast(prev));
+                    const cell_height: f32 = @floatFromInt(self.grid_metrics.cell_height);
+                    const offset: f32 = @as(f32, @floatFromInt(delta_rows)) * cell_height;
+
+                    // Hand the distance to the spring, which keeps whatever
+                    // velocity it already had, so a scroll part-way through
+                    // another blends with it instead of restarting.
+                    //
+                    // A jump of more than a screenful is a jump, not a
+                    // journey: cap it so paging to the top of the scrollback
+                    // lands rather than flying the whole way. The cap is the
+                    // visible grid, not the snapshot, which already carries
+                    // overscan rows and would otherwise let the cap grow
+                    // along with the scroll it is meant to bound.
+                    const max_px: f32 = cell_height *
+                        @as(f32, @floatFromInt(self.size.grid().rows));
+                    self.scroll_spring.add(offset);
+                    self.scroll_spring.position = std.math.clamp(
+                        self.scroll_spring.position,
+                        -max_px,
+                        max_px,
+                    );
+                }
+
                 // Smooth scrolling draws the grid part-way between rows,
                 // so it needs the row above what it is showing and the one
                 // below. It also lags the live viewport by however many
@@ -1574,25 +1644,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     ) catch &.{};
                 };
 
-                // The absolute row of the viewport top. Comparing this
-                // between frames tells us how far we scrolled, which is
-                // what drives the smooth scroll animation.
-                const viewport_y: ?usize = vp: {
-                    if (!self.config.pixel_scroll and
-                        self.config.cursor_animation_duration <= 0) break :vp null;
-                    const pages = &state.terminal.screens.active.pages;
-                    const pin = pages.getTopLeft(.viewport);
-                    const pt = pages.pointFromPin(.screen, pin) orelse break :vp null;
-                    break :vp pt.screen.y;
-                };
-
                 break :critical .{
                     .links = links,
                     .mouse = state.mouse,
                     .preedit = preedit,
                     .scrollbar = scrollbar,
                     .overlay_features = overlay_features,
-                    .viewport_y = viewport_y,
                 };
             };
 
@@ -1600,40 +1657,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // within it. This must be done before anything reads the
             // render state (e.g. rebuildCells).
             self.terminal_state.endUpdate();
-
-            // Smooth scrolling: if the viewport moved since the last frame,
-            // start the grid off by the distance it moved, so content is
-            // drawn where the eye last saw it, and let the animation carry
-            // it the rest of the way.
-            scroll: {
-                const vp_y = critical.viewport_y orelse break :scroll;
-                const prev_vp = self.scroll_viewport_y;
-                self.scroll_viewport_y = vp_y;
-
-                if (!self.config.pixel_scroll) break :scroll;
-                const prev = prev_vp orelse break :scroll;
-                if (vp_y == prev) break :scroll;
-
-                const delta_rows: i64 = @as(i64, @intCast(vp_y)) - @as(i64, @intCast(prev));
-                const cell_height: f32 = @floatFromInt(self.grid_metrics.cell_height);
-                const offset: f32 = @as(f32, @floatFromInt(delta_rows)) * cell_height;
-
-                // Hand the distance to the spring, which keeps whatever
-                // velocity it already had, so a scroll part-way through
-                // another blends with it instead of restarting.
-                //
-                // A jump of more than a screenful is a jump, not a
-                // journey: cap it so paging to the top of the scrollback
-                // lands rather than flying the whole way.
-                const max_px: f32 = cell_height *
-                    @as(f32, @floatFromInt(self.cells.size.rows));
-                self.scroll_spring.add(offset);
-                self.scroll_spring.position = std.math.clamp(
-                    self.scroll_spring.position,
-                    -max_px,
-                    max_px,
-                );
-            }
 
             // Outside the critical area we can update our links to contain
             // our regex results.
@@ -1947,10 +1970,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             const dt = self.animationDelta();
             self.stepScrollAnimation(dt);
             self.stepCursorAnimation(dt);
-            self.uniforms.cursor_offset = .{
-                self.cursor_spring_x.position,
-                self.cursor_spring_y.position,
-            };
+            const cursor_offsets = self.cursor_corners.offsets();
+            self.uniforms.cursor_offset_tl = cursor_offsets[0];
+            self.uniforms.cursor_offset_tr = cursor_offsets[1];
+            self.uniforms.cursor_offset_br = cursor_offsets[2];
+            self.uniforms.cursor_offset_bl = cursor_offsets[3];
             const grid_offset = self.gridYOffset();
             self.uniforms.grid_offset_y = grid_offset;
             self.uniforms.projection_matrix = self.projectionMatrix(grid_offset);
@@ -2368,16 +2392,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             if (dt <= 0) return;
             const duration = self.config.cursor_animation_duration;
             if (duration <= 0) {
-                self.cursor_spring_x.reset();
-                self.cursor_spring_y.reset();
+                self.cursor_corners.reset();
                 return;
             }
 
             // Bounciness lowers the damping ratio: 0 is critically damped,
             // 1 is loose enough to overshoot and spring back.
             const zeta = 1.0 - self.config.cursor_animation_bounciness * 0.7;
-            _ = self.cursor_spring_x.update(dt, duration, zeta);
-            _ = self.cursor_spring_y.update(dt, duration, zeta);
+            _ = self.cursor_corners.update(dt, zeta);
         }
 
         /// How far down to draw the grid, in pixels.
@@ -2918,8 +2940,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     std.math.maxInt(u16),
                 };
                 self.cursor_last_pos = null;
-                self.cursor_spring_x.reset();
-                self.cursor_spring_y.reset();
+                self.cursor_corners.reset();
 
                 // If the cursor isn't visible on the viewport, don't show
                 // a cursor. Otherwise, get our cursor cell, because we may
@@ -3015,23 +3036,57 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         // moving. Absolute rows are immune to both, and the
                         // scroll spring animates the content's own movement.
                         const vp_y = self.scroll_viewport_y orelse break :cursor_anim;
-                        const abs_y: i64 = @as(i64, @intCast(vp_y)) -
-                            @as(i64, @intCast(self.terminal_state.rows_above)) +
-                            @as(i64, @intCast(cursor_vp.y));
 
-                        const pos: [2]i64 = .{ @intCast(cursor_vp.x), abs_y };
+                        // The snapshot starts above the viewport when a
+                        // scroll is in flight, so the cursor's row within
+                        // it is that many rows further down than the row
+                        // of the screen it is on.
+                        const screen_y: i64 = @as(i64, @intCast(cursor_vp.y)) -
+                            @as(i64, @intCast(self.terminal_state.rows_above));
+
+                        const pos: CursorPos = .{
+                            .x = @intCast(cursor_vp.x),
+                            .y = @as(i64, @intCast(vp_y)) + screen_y,
+                            .screen_y = screen_y,
+                        };
                         defer self.cursor_last_pos = pos;
 
                         const prev = self.cursor_last_pos orelse break :cursor_anim;
 
-                        const dx: i64 = prev[0] - pos[0];
-                        const dy: i64 = prev[1] - pos[1];
+                        const dx: i64 = pos.x - prev.x;
+                        const dy: i64 = pos.y - prev.y;
                         if (dx == 0 and dy == 0) break :cursor_anim;
 
                         const cw: f32 = @floatFromInt(self.grid_metrics.cell_width);
                         const ch: f32 = @floatFromInt(self.grid_metrics.cell_height);
-                        self.cursor_spring_x.add(@as(f32, @floatFromInt(dx)) * cw);
-                        self.cursor_spring_y.add(@as(f32, @floatFromInt(dy)) * ch);
+
+                        // A cursor that held its row on screen while the
+                        // terminal scrolled under it was carried by the
+                        // grid: it is riding the line it sits on, which is
+                        // already gliding, so it travels in one piece and
+                        // over the same time rather than striking out on
+                        // its own and stretching. Output at the bottom of
+                        // the screen does this on every line.
+                        if (dx == 0 and pos.screen_y == prev.screen_y) {
+                            self.cursor_corners.follow(
+                                0,
+                                @floatFromInt(dy),
+                                cw,
+                                ch,
+                                if (self.config.pixel_scroll)
+                                    self.config.scroll_animation_duration
+                                else
+                                    self.config.cursor_animation_duration,
+                            );
+                        } else {
+                            self.cursor_corners.move(
+                                @floatFromInt(dx),
+                                @floatFromInt(dy),
+                                cw,
+                                ch,
+                                self.config.cursor_animation_duration,
+                            );
+                        }
                     }
 
                     self.uniforms.bools.cursor_wide = switch (wide) {

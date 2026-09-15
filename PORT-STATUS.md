@@ -30,30 +30,64 @@ feature is in the Zig core, so no Swift changes are needed.
 
 ## What's implemented
 
-`pixel-scroll`, `scroll-animation-duration` (see Config.zig for docs).
+`pixel-scroll`, `scroll-animation-duration`, `scroll-animation-bounciness`,
+`cursor-animation-duration`, `cursor-animation-bounciness` (see Config.zig
+for docs).
+
+### Motion
+
+`animation.zig` holds a critically damped spring, the same model Neovide
+and the fork use. It carries velocity, so a move eases in and out and a
+second move part-way through the first blends with it rather than
+restarting it. An earlier attempt decayed the offset exponentially
+instead; it read as lag rather than as motion, and the difference is
+plainly visible side by side with the fork.
+
+### Scrolling
 
 - `updateFrame` records the viewport's absolute row (`.screen` point of
-  the viewport top). When it changes, the grid is offset by the distance
-  moved, so content is drawn where the eye last saw it.
-- The offset goes into the **projection matrix** (`projectionMatrix()`),
-  not into the cell data. No cell-ABI change and no shader edits, so
-  Metal and OpenGL both get it. The fork instead added a per-cell
-  `offset_y_fixed`, which meant changing the Zig struct, the MSL shaders
-  and the GLSL shaders together.
-- `stepScrollAnimation()` decays the offset exponentially on wall-clock
-  time, and `animationWake()` requests draws until it settles — reusing
-  upstream's animation timer.
+  the viewport top). When it changes, the distance moved goes to the
+  spring, so content is drawn where the eye last saw it and travels from
+  there. This happens **before** the render state snapshot is built, not
+  after: the snapshot is asked for exactly the rows this frame will slide
+  into view.
+- `RenderState.beginUpdate` takes an `Overscan`, and builds rows above and
+  below the viewport. The renderer lags the snapshot by however many whole
+  rows the scroll still has to travel and draws the remainder as a
+  sub-cell offset, so a multi-row scroll animates the whole distance with
+  two spare rows rather than one row per row travelled.
+- The draw offset goes into the **projection matrix**
+  (`projectionMatrix()`), not the cell data, so the vertices need no
+  per-cell ABI change. The background shader maps screen pixels back to
+  grid rows, so it gets the offset as a uniform (`grid_offset_y`) to undo.
 
-### Known limits (next steps)
+### The cursor
 
-1. **The offset is clamped to one cell.** We only draw the viewport's own
-   rows, so any offset leaves that much background at one edge. Overscan
-   rows above and below the viewport lift this.
-2. **Scroll detection uses absolute `.screen` rows.** Once the scrollback
+- `CornerCursor` springs each of the cursor quad's four corners
+  separately. The corners facing the way it is going arrive first, the
+  ones behind hold back, so the cursor stretches out of the cell it left
+  and gathers itself into the cell it lands on. This is Neovide's cursor,
+  by way of the fork; a cursor that slides rigidly reads as a cursor
+  that is late.
+- The four corner offsets are uniforms, applied in the cell-text vertex
+  shader to the cursor glyph only (`IS_CURSOR_GLYPH`), after the quad's
+  own corner is worked out. The character underneath does not move.
+- Cursor position is tracked in the **content**, not on screen, so
+  scrolling the grid under the cursor is not mistaken for the cursor
+  moving. A cursor that keeps its row on screen while the terminal
+  scrolls — output at the bottom of the screen, every line — is carried
+  by the grid, so it travels in one piece over the scroll's own duration
+  rather than stretching on every line.
+
+### Known limits
+
+1. **Scroll detection uses absolute `.screen` rows.** Once the scrollback
    is full, an evicted row cancels out an appended one, so output-driven
    scrolling stops animating at the limit. User scrolling is unaffected.
-3. **Cursor animation isn't done.** It needs sub-cell cursor placement,
-   which unlike the scroll offset does require a shader/ABI change.
+2. **The character under the cursor inverts at the destination**, in one
+   step, while the cursor is still on its way. Neovide does the same.
+3. **Scroll distance is capped at one screen**, so paging to the top of
+   the scrollback lands rather than flying the whole way.
 
 ## Building
 

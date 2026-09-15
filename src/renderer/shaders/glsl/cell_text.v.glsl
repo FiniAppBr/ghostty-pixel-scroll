@@ -49,13 +49,6 @@ void main() {
     // Convert the grid x, y into world space x, y by accounting for cell size
     vec2 cell_pos = cell_size * vec2(grid_pos);
 
-    // The cursor is drawn at an offset from its cell while it animates
-    // towards a new position. Only the cursor glyph moves; the character
-    // underneath it stays where it is.
-    if ((glyph_bools & IS_CURSOR_GLYPH) != 0u) {
-        cell_pos += cursor_offset;
-    }
-
     int vid = gl_VertexID;
 
     // We use a triangle strip with 4 vertices to render quads,
@@ -112,6 +105,17 @@ void main() {
     // Calculate the final position of the cell which uses our glyph size
     // and glyph offset to create the correct bounding box for the glyph.
     cell_pos = cell_pos + size * corner + offset;
+
+    // The cursor is drawn away from its cell while it animates towards a new
+    // position, and each corner of it carries its own offset, so it stretches
+    // between the cell it left and the one it is arriving at. Only the cursor
+    // glyph moves; the character underneath it stays where it is.
+    if ((glyph_bools & IS_CURSOR_GLYPH) != 0u) {
+        cell_pos += corner.y < 0.5
+            ? (corner.x < 0.5 ? cursor_offset_tl : cursor_offset_tr)
+            : (corner.x < 0.5 ? cursor_offset_bl : cursor_offset_br);
+    }
+
     gl_Position = projection_matrix * vec4(cell_pos.x, cell_pos.y, 0.0f, 1.0f);
 
     // Calculate the texture coordinate in pixels. This is NOT normalized

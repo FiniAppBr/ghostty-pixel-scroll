@@ -24,7 +24,10 @@ struct Uniforms {
   bool use_display_p3;
   bool use_linear_blending;
   bool use_linear_correction;
-  float2 cursor_offset;
+  float2 cursor_offset_tl;
+  float2 cursor_offset_tr;
+  float2 cursor_offset_br;
+  float2 cursor_offset_bl;
   float grid_offset_y;
 };
 
@@ -568,13 +571,6 @@ vertex CellTextVertexOut cell_text_vertex(
   // Convert the grid x, y into world space x, y by accounting for cell size
   float2 cell_pos = uniforms.cell_size * float2(in.grid_pos);
 
-  // The cursor is drawn at an offset from its cell while it animates
-  // towards a new position. Only the cursor glyph moves; the character
-  // underneath it stays where it is.
-  if ((in.bools & IS_CURSOR_GLYPH) != 0) {
-    cell_pos += uniforms.cursor_offset;
-  }
-
   // We use a triangle strip with 4 vertices to render quads,
   // so we determine which corner of the cell this vertex is in
   // based on the vertex ID.
@@ -630,6 +626,19 @@ vertex CellTextVertexOut cell_text_vertex(
   // Calculate the final position of the cell which uses our glyph size
   // and glyph offset to create the correct bounding box for the glyph.
   cell_pos = cell_pos + size * corner + offset;
+
+  // The cursor is drawn away from its cell while it animates towards a new
+  // position, and each corner of it carries its own offset, so it stretches
+  // between the cell it left and the one it is arriving at. Only the cursor
+  // glyph moves; the character underneath it stays where it is.
+  if ((in.bools & IS_CURSOR_GLYPH) != 0) {
+    cell_pos += corner.y < 0.5f
+        ? (corner.x < 0.5f ? uniforms.cursor_offset_tl
+                           : uniforms.cursor_offset_tr)
+        : (corner.x < 0.5f ? uniforms.cursor_offset_bl
+                           : uniforms.cursor_offset_br);
+  }
+
   out.position =
       uniforms.projection_matrix * float4(cell_pos.x, cell_pos.y, 0.0f, 1.0f);
 

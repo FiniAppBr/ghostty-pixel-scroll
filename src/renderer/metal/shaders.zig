@@ -254,20 +254,25 @@ pub const Uniforms = extern struct {
         use_linear_correction: bool align(1) = false,
     },
 
-    /// Pixel offset applied to the cursor glyph only (instances with the
-    /// IS_CURSOR_GLYPH bit). Smooth cursor motion draws the cursor away
-    /// from its grid cell while it catches up.
+    /// Pixel offsets applied to the four corners of the cursor glyph only
+    /// (instances with the IS_CURSOR_GLYPH bit), in order: top-left,
+    /// top-right, bottom-right, bottom-left. Smooth cursor motion springs
+    /// each corner on its own, so the cursor stretches out of the cell it
+    /// left and gathers itself into the one it lands on.
     ///
-    /// Must stay the last field: the shader structs append it in the same
-    /// place, where a vec2's 8-byte alignment pads predictably.
-    cursor_offset: [2]f32 align(8) = .{ 0, 0 },
+    /// These stay together and ahead of `grid_offset_y`: the shader
+    /// structs list them in the same order, where a vec2's 8-byte
+    /// alignment pads predictably.
+    cursor_offset_tl: [2]f32 align(8) = .{ 0, 0 },
+    cursor_offset_tr: [2]f32 align(8) = .{ 0, 0 },
+    cursor_offset_br: [2]f32 align(8) = .{ 0, 0 },
+    cursor_offset_bl: [2]f32 align(8) = .{ 0, 0 },
 
     /// How far down the grid is drawn from its settled position, in
     /// pixels. The vertices carry this through the projection matrix, but
     /// the background shader maps screen pixels back to grid rows and has
     /// to undo it.
     grid_offset_y: f32 align(4) = 0,
-
 
     const PaddingExtend = packed struct(u8) {
         left: bool = false,
