@@ -468,6 +468,14 @@ extension Ghostty {
             return v
         }
 
+        var focusFollowsScroll: Bool {
+            guard let config = self.config else { return false }
+            var v = false
+            let key = "focus-follows-scroll"
+            _ = ghostty_config_get(config, &v, key, UInt(key.lengthOfBytes(using: .utf8)))
+            return v
+        }
+
         var backgroundColor: Color {
             var color: ghostty_config_color_s = .init()
             let bg_key = "background"

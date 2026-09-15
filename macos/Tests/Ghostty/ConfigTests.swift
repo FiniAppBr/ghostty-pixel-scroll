@@ -41,6 +41,21 @@ struct ConfigTests {
         #expect(config.focusFollowsMouse == true)
     }
 
+    @Test func focusFollowsScrollDefaultsToFalse() throws {
+        let config = try TemporaryConfig("")
+        #expect(config.focusFollowsScroll == false)
+    }
+
+    @Test func focusFollowsScrollSetToTrue() throws {
+        let config = try TemporaryConfig("focus-follows-scroll = true")
+        #expect(config.focusFollowsScroll == true)
+    }
+
+    @Test func focusFollowsScrollIsIndependentOfFocusFollowsMouse() throws {
+        let config = try TemporaryConfig("focus-follows-scroll = true")
+        #expect(config.focusFollowsMouse == false)
+    }
+
     @Test func windowDecorationsDefaultsToTrue() throws {
         let config = try TemporaryConfig("")
         #expect(config.windowDecorations == true)

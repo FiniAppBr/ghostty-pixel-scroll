@@ -67,6 +67,11 @@ class BaseTerminalController: NSWindowController,
         self.derivedConfig.focusFollowsMouse
     }
 
+    /// Whether the terminal surface should focus when scrolled over.
+    var focusFollowsScroll: Bool {
+        self.derivedConfig.focusFollowsScroll
+    }
+
     /// Non-nil when an alert is active so we don't overlap multiple.
     private var alert: NSAlert?
 
@@ -1478,12 +1483,14 @@ class BaseTerminalController: NSWindowController,
         let macosTitlebarProxyIcon: Ghostty.MacOSTitlebarProxyIcon
         let windowStepResize: Bool
         let focusFollowsMouse: Bool
+        let focusFollowsScroll: Bool
         let splitPreserveZoom: Ghostty.Config.SplitPreserveZoom
 
         init() {
             self.macosTitlebarProxyIcon = .visible
             self.windowStepResize = false
             self.focusFollowsMouse = false
+            self.focusFollowsScroll = false
             self.splitPreserveZoom = .init()
         }
 
@@ -1491,6 +1498,7 @@ class BaseTerminalController: NSWindowController,
             self.macosTitlebarProxyIcon = config.macosTitlebarProxyIcon
             self.windowStepResize = config.windowStepResize
             self.focusFollowsMouse = config.focusFollowsMouse
+            self.focusFollowsScroll = config.focusFollowsScroll
             self.splitPreserveZoom = config.splitPreserveZoom
         }
     }

@@ -2540,6 +2540,22 @@ keybind: Keybinds = .{},
 /// Default is false.
 @"focus-follows-mouse": bool = false,
 
+/// If true, scrolling over a split focuses it, the same way that
+/// `focus-follows-mouse` does for pointer motion.
+///
+/// This is separate from `focus-follows-mouse` because a trackpad scroll
+/// doesn't move the pointer, so motion-based focus never sees it: with the
+/// pointer already resting over a split, scrolling that split would leave
+/// focus wherever it already was.
+///
+/// Momentum events are ignored, so a flick that is still coasting won't drag
+/// focus back after you've moved on to another split.
+///
+/// Like `focus-follows-mouse`, this only applies within the focused window.
+///
+/// Default is false.
+@"focus-follows-scroll": bool = false,
+
 /// Whether to allow programs running in the terminal to read/write to the
 /// system clipboard (OSC 52, for googling). The default is to allow clipboard
 /// reading after prompting the user and allow writing unconditionally.

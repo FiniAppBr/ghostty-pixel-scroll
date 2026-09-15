@@ -1058,6 +1058,24 @@ extension Ghostty {
         override func scrollWheel(with event: NSEvent) {
             guard let surfaceModel else { return }
 
+            // Handle focus-follows-scroll. A trackpad scroll doesn't move the
+            // pointer, so mouseMoved never fires and focus-follows-mouse can't
+            // see it: the split under the pointer would scroll while focus sat
+            // somewhere else.
+            //
+            // Momentum events are skipped. They keep arriving after the fingers
+            // lift, so a flick here followed by a click into another split would
+            // otherwise yank focus back as the coast finishes.
+            if event.momentumPhase.isEmpty,
+               let window,
+               let controller = window.windowController as? BaseTerminalController,
+               !controller.commandPaletteIsShowing,
+               window.isKeyWindow,
+               !self.focused,
+               controller.focusFollowsScroll {
+                Ghostty.moveFocus(to: self)
+            }
+
             var x = event.scrollingDeltaX
             var y = event.scrollingDeltaY
             let precision = event.hasPreciseScrollingDeltas
