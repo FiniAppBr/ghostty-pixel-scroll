@@ -97,6 +97,7 @@ jobs:
             zig build test \
               -Dtest-filter=prediction \
               -Dtest-filter=animation \
+              -Dtest-filter=cursor_rect \
               -Doptimize=Debug
             echo "tests passed"
           } 2>&1 | tee -a "$CI_LOG"
