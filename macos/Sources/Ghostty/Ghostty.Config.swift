@@ -211,6 +211,14 @@ extension Ghostty {
             return String(cString: ptr)
         }
 
+        var initialSplits: UInt8 {
+            guard let config = self.config else { return 0 }
+            var v: UInt8 = 0
+            let key = "initial-splits"
+            _ = ghostty_config_get(config, &v, key, UInt(key.lengthOfBytes(using: .utf8)))
+            return v
+        }
+
         var windowSaveState: String {
             guard let config = self.config else { return "" }
             var v: UnsafePointer<Int8>?

@@ -308,6 +308,25 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
             // All new_window actions force our app to be active, so that the new
             // window is focused and visible.
             NSApp.activate(ignoringOtherApps: true)
+
+            // Open the splits the config asks every window to start with.
+            // This is deliberately after presentation: the surface has to
+            // exist before it can be split, and the window has to be sized
+            // before the splits can be made even.
+            let extraSplits = Int(ghostty.config.initialSplits)
+            if extraSplits > 0 {
+                DispatchQueue.main.async {
+                    var view = c.focusedSurface ?? c.surfaceTree.root?.leaves().first
+                    for _ in 0..<extraSplits {
+                        guard let current = view else { break }
+                        view = c.newSplit(at: current, direction: .right)
+                    }
+
+                    // Splitting halves whatever it lands on, so three of
+                    // them would come out 50/25/25 without this.
+                    c.surfaceTree = c.surfaceTree.equalized()
+                }
+            }
         }
 
         // Setup our undo
