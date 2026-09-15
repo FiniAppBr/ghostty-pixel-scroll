@@ -66,6 +66,11 @@ pub const Config = struct {
     /// happens at a wrap depends on the far end's autowrap mode and on
     /// whether the line is continued, which is more than can be guessed.
     margin: u16 = 2,
+
+    /// Draw without first watching the far end echo correctly. This skips
+    /// earning trust, not the password guard: once typing has gone
+    /// unanswered, nothing is drawn regardless of this.
+    eager: bool = false,
 };
 
 /// One character we are waiting to see come back.
@@ -143,7 +148,14 @@ pub const Engine = struct {
         // this only declines to *draw*: the entry is still tracked, so
         // echo confirmation keeps working across the wrap.
         const room = cols -| self.config.margin;
-        const draw = self.epoch == .predicting and x < room;
+        const trusted = switch (self.epoch) {
+            .predicting => true,
+            // Eager mode skips earning trust, but never overrides silence:
+            // that is the password guard, and it is not negotiable.
+            .observing => self.config.eager,
+            .silent => false,
+        };
+        const draw = trusted and x < room;
 
         self.entries[self.len] = .{
             .cp = cp,
@@ -406,6 +418,27 @@ test "drawn reports only what is on screen, in order" {
     try std.testing.expectEqual(@as(usize, 2), d.len);
     try std.testing.expectEqual(@as(u21, 'a'), d[0].cp);
     try std.testing.expectEqual(@as(u21, 'c'), d[1].cp);
+}
+
+test "eager mode draws without waiting to earn it" {
+    var e: Engine = .{ .config = .{ .eager = true } };
+
+    // No warm-up: the first keystroke is already on screen.
+    try std.testing.expect(e.typed('x', 0, 0, 80, 0));
+    try std.testing.expectEqual(Epoch.observing, e.epoch);
+}
+
+test "eager mode still refuses at a password prompt" {
+    var e: Engine = .{ .config = .{ .eager = true } };
+
+    _ = e.typed('s', 0, 0, 80, 1.0);
+    e.tick(1.0 + e.config.timeout + 0.01);
+    try std.testing.expectEqual(Epoch.silent, e.epoch);
+
+    // Eagerness does not override silence. This is the guard that keeps
+    // passwords off the screen and it outranks every other setting.
+    try std.testing.expect(!e.typed('e', 0, 0, 80, 1.2));
+    try std.testing.expect(!e.hasDrawn());
 }
 
 test "timeout does not fire while echoes keep arriving" {

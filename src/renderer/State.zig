@@ -5,10 +5,12 @@ const State = @This();
 const std = @import("std");
 const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
+const global = @import("../global.zig");
 const Inspector = @import("../inspector/main.zig").Inspector;
 const terminalpkg = @import("../terminal/main.zig");
 const inputpkg = @import("../input.zig");
 const renderer = @import("../renderer.zig");
+const predictionpkg = @import("prediction.zig");
 
 /// The mutex that must be held while reading any of the data in the
 /// members of this state. Note that the state itself is NOT protected
@@ -33,6 +35,17 @@ preedit: ?Preedit = null,
 /// need about the mouse.
 mouse: Mouse = .{},
 
+/// Characters typed but not yet echoed back by whatever is on the other
+/// end, drawn ahead of the echo so typing over a slow link does not wait
+/// a round trip per keystroke. Recorded by the surface when a key is
+/// pressed, reconciled by the stream handler as output arrives, and read
+/// by the renderer. All three touch it under `mutex`.
+prediction: predictionpkg.Engine = .{},
+
+/// Base for `predictionNow`. The engine works in plain seconds so that it
+/// can be tested without a clock; this is where those seconds come from.
+prediction_clock: ?std.Io.Timestamp = null,
+
 /// The number of threads currently waiting to acquire `mutex` via
 /// `lockDemand`. This is not protected by the mutex; it is read by
 /// hot lock/unlock loops (the IO parse thread) in `yieldToDemand` to
@@ -50,6 +63,23 @@ handoff_gen: std.atomic.Value(u32) = .init(0),
 /// demanding critical section (the renderer's frame snapshot) is
 /// microseconds, so one millisecond is generous.
 const handoff_timeout_ns = 1 * std.time.ns_per_ms;
+
+/// Seconds on the prediction engine's clock, counting from the first call.
+/// Only meaningful relative to itself, which is all the engine needs: it
+/// works in plain seconds so it can be tested without a clock at all.
+pub fn predictionNow(self: *State) f32 {
+    const now: std.Io.Timestamp = .now(global.io(), .awake);
+    const base = self.prediction_clock orelse {
+        self.prediction_clock = now;
+        return 0;
+    };
+
+    const ns = base.durationTo(now).nanoseconds;
+    if (ns <= 0) return 0;
+    return @floatCast(
+        @as(f64, @floatFromInt(ns)) / @as(f64, std.time.ns_per_s),
+    );
+}
 
 /// Acquire `mutex` while signaling demand for it. Use this instead of
 /// locking the mutex directly on threads that must not be starved by

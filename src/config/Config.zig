@@ -1058,6 +1058,42 @@ palette: Palette = .{},
 /// does scrolling old content back into view.
 @"text-fade-duration": f32 = 0.0,
 
+/// Draw typed characters immediately rather than waiting for the far end to
+/// echo them back. Over a link with a round trip this is the difference
+/// between typing that feels local and typing that lags by the latency of
+/// the connection.
+///
+/// This does what mosh does, but from inside the terminal rather than from a
+/// process on the other side of it, so the connection stays an ordinary
+/// stream whose lines scroll into scrollback as usual. Scrollback, smooth
+/// scrolling and the text fade all keep working, which they do not under
+/// mosh.
+///
+///   * `auto` — predict only after watching the far end echo correctly a few
+///     times, and stop at the first surprise. This is the only value that is
+///     safe to leave on for a local shell, where there is nothing to gain.
+///
+///   * `always` — predict as soon as anything is typed. Useful for testing;
+///     it will show wrong characters on a connection that does not echo.
+///
+///   * `never` — off.
+///
+/// Predictions are never made at a password prompt: characters that are typed
+/// and never echoed are taken as a sign that nothing should be drawn, and
+/// nothing is until echo is seen working again.
+@"local-echo": LocalEcho = .auto,
+
+/// How long to wait for the far end to echo a predicted character, in
+/// seconds, before concluding that no echo is coming and erasing what was
+/// drawn. Needs to be comfortably longer than the round trip, or ordinary
+/// slowness reads as a password prompt.
+@"local-echo-timeout": f32 = 0.15,
+
+/// How solid a predicted character looks before the far end confirms it, from
+/// 0 to 1. Below 1 a prediction is visibly a guess, so a wrong one reads as
+/// the terminal correcting itself rather than as text changing under you.
+@"local-echo-opacity": f32 = 0.6,
+
 /// The opacity level (opposite of transparency) of the background. A value of
 /// 1 is fully opaque and a value of 0 is fully transparent. A value less than 0
 /// or greater than 1 will be clamped to the nearest valid value.
@@ -4908,6 +4944,12 @@ pub fn finalize(self: *Config) !void {
     self.@"cursor-animation-bounciness" = @min(1.0, @max(0.0, self.@"cursor-animation-bounciness"));
     self.@"text-fade-duration" = @min(2.0, @max(0.0, self.@"text-fade-duration"));
 
+    // A timeout below the round trip would read every keystroke as a
+    // password prompt; one above a second would leave a wrong guess on
+    // screen long enough to be read as real text.
+    self.@"local-echo-timeout" = @min(1.0, @max(0.02, self.@"local-echo-timeout"));
+    self.@"local-echo-opacity" = @min(1.0, @max(0.1, self.@"local-echo-opacity"));
+
     // Clamp our split opacity
     self.@"unfocused-split-opacity" = @min(1.0, @max(0.15, self.@"unfocused-split-opacity"));
 
@@ -5508,6 +5550,16 @@ pub const CustomShaderAnimation = enum(c_int) {
     false,
     true,
     always,
+};
+
+/// Valid values for local-echo.
+pub const LocalEcho = enum {
+    /// Predict only once the far end has been seen echoing correctly.
+    auto,
+    /// Predict from the first keystroke, without waiting for evidence.
+    always,
+    /// Never predict.
+    never,
 };
 
 /// Valid values for macos-non-native-fullscreen

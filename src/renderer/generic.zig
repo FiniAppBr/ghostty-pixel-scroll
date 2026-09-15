@@ -15,6 +15,7 @@ const Surface = @import("../Surface.zig");
 const link = @import("link.zig");
 const cellpkg = @import("cell.zig");
 const animationpkg = @import("animation.zig");
+const predictionpkg = @import("prediction.zig");
 const noMinContrast = cellpkg.noMinContrast;
 const constraintWidth = cellpkg.constraintWidth;
 const isCovering = cellpkg.isCovering;
@@ -299,6 +300,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         text_fade: TextFade = .{},
         cursor_last_pos: ?CursorPos = null,
         cursor_clock: ?std.Io.Timestamp = null,
+
+        /// Whether anything typed is currently drawn ahead of its echo.
+        /// Predictions expire by the clock, and only a frame notices the
+        /// clock, so while this is set the renderer keeps waking to check.
+        predicting: bool = false,
 
         const HighlightTag = enum(u8) {
             search_match,
@@ -737,6 +743,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             scroll_animation_duration: f32,
             cursor_animation_duration: f32,
             text_fade_duration: f32,
+            local_echo_opacity: f32,
             scroll_animation_bounciness: f32,
             cursor_animation_bounciness: f32,
             custom_shader_animation: configpkg.CustomShaderAnimation,
@@ -819,6 +826,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .scroll_animation_duration = config.@"scroll-animation-duration",
                     .cursor_animation_duration = config.@"cursor-animation-duration",
                     .text_fade_duration = config.@"text-fade-duration",
+                    .local_echo_opacity = config.@"local-echo-opacity",
                     .scroll_animation_bounciness = config.@"scroll-animation-bounciness",
                     .cursor_animation_bounciness = config.@"cursor-animation-bounciness",
                     .arena = arena,
@@ -1286,6 +1294,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 return .{ .delay_ms = draw_interval_ms, .kind = .update };
             }
 
+            // Predictions expire on a timer and nothing else notices the
+            // timer running out: no output arrives at a password prompt,
+            // which is exactly the case that must not be left on screen.
+            // So while anything is predicted, keep asking for frames.
+            if (self.predicting) {
+                return .{ .delay_ms = draw_interval_ms, .kind = .update };
+            }
+
             const draw_delay: ?u64 = if (shader_delay) |s|
                 if (scroll_delay) |sc| @min(s, sc) else s
             else
@@ -1512,6 +1528,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 links: terminal.RenderState.CellSet,
                 mouse: renderer.State.Mouse,
                 preedit: ?renderer.State.Preedit,
+                predictions: []const u21,
                 scrollbar: terminal.Scrollbar,
                 overlay_features: []const Overlay.Feature,
             };
@@ -1677,6 +1694,26 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     break :preedit try p.clone(arena_alloc);
                 };
 
+                // Characters typed but not echoed back yet. Expiring the
+                // stale ones happens here rather than on the IO thread
+                // because it is time passing that makes them stale, and
+                // frames are the only thing that notices time passing. A
+                // prediction that is never confirmed is what a password
+                // prompt looks like from here, so it must not linger.
+                const predictions: []const u21 = predictions: {
+                    state.prediction.tick(state.predictionNow());
+
+                    var buf: [predictionpkg.capacity]predictionpkg.Entry = undefined;
+                    const drawn = state.prediction.drawn(&buf);
+                    if (drawn.len == 0) break :predictions &.{};
+
+                    const cps = arena_alloc.alloc(u21, drawn.len) catch
+                        break :predictions &.{};
+                    for (drawn, cps) |e, *cp| cp.* = e.cp;
+                    break :predictions cps;
+                };
+                self.predicting = predictions.len > 0;
+
                 // Advance any running Kitty graphics animations to the
                 // frame due now, and remember when the next frame is
                 // due (as an absolute deadline, see animationWake) so
@@ -1757,6 +1794,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .links = links,
                     .mouse = state.mouse,
                     .preedit = preedit,
+                    .predictions = predictions,
                     .scrollbar = scrollbar,
                     .overlay_features = overlay_features,
                 };
@@ -1851,6 +1889,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // Build our GPU cells
                 self.rebuildCells(
                     critical.preedit,
+                    critical.predictions,
                     renderer.cursorStyle(&self.terminal_state, .{
                         .preedit = critical.preedit != null,
                         .focused = self.focused,
@@ -3005,6 +3044,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         fn rebuildCells(
             self: *Self,
             preedit: ?renderer.State.Preedit,
+            predictions: []const u21,
             cursor_style_: ?renderer.CursorStyle,
             links: *const terminal.RenderState.CellSet,
         ) Allocator.Error!void {
@@ -3412,6 +3452,37 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     };
 
                     x += if (cp.wide) 2 else 1;
+                }
+            }
+
+            // Characters typed but not yet echoed back, drawn from the
+            // cursor forward. They are always contiguous from there: the
+            // terminal has not seen them, so its cursor still sits where
+            // the first one goes, and anything that would have moved the
+            // cursor another way abandoned them before we got here.
+            if (predictions.len > 0) predict: {
+                const cursor_vp = state.cursor.viewport orelse break :predict;
+                const alpha: u8 = @intFromFloat(@round(
+                    @max(0.0, @min(1.0, self.config.local_echo_opacity)) * 255.0,
+                ));
+
+                var x: usize = cursor_vp.x;
+                for (predictions) |cp| {
+                    if (x >= state.cols) break;
+                    self.addPredictionCell(
+                        cp,
+                        @intCast(x),
+                        @intCast(cursor_vp.y),
+                        state.colors.foreground,
+                        alpha,
+                    ) catch |err| {
+                        log.warn(
+                            "error building prediction cell x={} y={} err={}",
+                            .{ x, cursor_vp.y, err },
+                        );
+                        break :predict;
+                    };
+                    x += 1;
                 }
             }
 
@@ -4182,6 +4253,54 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             if (cp.wide and coord.x < self.cells.size.columns - 1) {
                 try self.addUnderline(@intCast(coord.x + 1), @intCast(coord.y), .single, screen_fg, 255);
             }
+        }
+
+        /// Draw a character that has been typed but not yet echoed back by
+        /// whatever is on the other end. It is the glyph the text will
+        /// have, at reduced alpha: a prediction that reads as provisional
+        /// is one the eye forgives when it turns out wrong.
+        ///
+        /// Unlike preedit this carries no underline. Preedit is text the
+        /// user is still composing and wants marked; this is meant to pass
+        /// for the real thing a few milliseconds early.
+        fn addPredictionCell(
+            self: *Self,
+            cp: u21,
+            x: terminal.size.CellCountInt,
+            y: terminal.size.CellCountInt,
+            screen_fg: terminal.color.RGB,
+            alpha: u8,
+        ) !void {
+            const render_ = self.font_grid.renderCodepoint(
+                self.alloc,
+                @intCast(cp),
+                .regular,
+                .text,
+                .{
+                    .grid_metrics = self.grid_metrics,
+                    .thicken = self.config.font_thicken,
+                    .thicken_strength = self.config.font_thicken_strength,
+                },
+            ) catch |err| {
+                log.warn("error rendering prediction glyph err={}", .{err});
+                return;
+            };
+
+            // No glyph for it is not worth a warning on every keystroke;
+            // the character simply waits for the echo like it used to.
+            const render = render_ orelse return;
+
+            try self.cells.add(self.alloc, .text, .{
+                .atlas = .grayscale,
+                .grid_pos = .{ @intCast(x), @intCast(y) },
+                .color = .{ screen_fg.r, screen_fg.g, screen_fg.b, alpha },
+                .glyph_pos = .{ render.glyph.atlas_x, render.glyph.atlas_y },
+                .glyph_size = .{ render.glyph.width, render.glyph.height },
+                .bearings = .{
+                    @intCast(render.glyph.offset_x),
+                    @intCast(render.glyph.offset_y),
+                },
+            });
         }
 
         /// Sync the atlas data to the given texture. This copies the bytes

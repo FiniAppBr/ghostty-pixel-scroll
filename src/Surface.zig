@@ -319,6 +319,8 @@ const DerivedConfig = struct {
     mouse_shift_capture: configpkg.MouseShiftCapture,
     fullscreen: configpkg.Fullscreen,
     macos_non_native_fullscreen: configpkg.NonNativeFullscreen,
+    local_echo: configpkg.Config.LocalEcho,
+    local_echo_timeout: f32,
     macos_option_as_alt: ?input.OptionAsAlt,
     selection_clear_on_copy: bool,
     selection_clear_on_typing: bool,
@@ -399,6 +401,8 @@ const DerivedConfig = struct {
             .mouse_shift_capture = config.@"mouse-shift-capture",
             .fullscreen = config.fullscreen,
             .macos_non_native_fullscreen = config.@"macos-non-native-fullscreen",
+            .local_echo = config.@"local-echo",
+            .local_echo_timeout = config.@"local-echo-timeout",
             .macos_option_as_alt = config.@"macos-option-as-alt",
             .selection_clear_on_copy = config.@"selection-clear-on-copy",
             .selection_clear_on_typing = config.@"selection-clear-on-typing",
@@ -2877,10 +2881,71 @@ pub fn keyCallback(
 
         if (self.config.scroll_to_bottom.keystroke) self.io.terminal.scrollViewport(.bottom);
 
+        // Draw this keystroke ahead of the far end's echo, where that has
+        // been earned. Anything we cannot place confidently abandons the
+        // predictions already on screen rather than guessing past it.
+        self.recordPrediction(event);
+
         try self.queueRender();
     }
 
     return .consumed;
+}
+
+/// Record a keypress as a local echo prediction, or abandon the predictions
+/// in flight if this key is not one whose effect we can place.
+///
+/// Must be called with the renderer state mutex held.
+fn recordPrediction(self: *Surface, event: input.KeyEvent) void {
+    const state = &self.renderer_state;
+    const pred = &state.prediction;
+
+    if (self.config.local_echo == .never) {
+        pred.flush();
+        return;
+    }
+
+    pred.config.timeout = self.config.local_echo_timeout;
+    pred.config.eager = self.config.local_echo == .always;
+
+    // Only a plain press of a printable character. A modifier that turns
+    // the key into something else, a control character, or anything that
+    // is not exactly one codepoint, all move the cursor in ways we would
+    // only be guessing at. Shift is fine: that is just capitals.
+    const cp: u21 = cp: {
+        if (event.action == .release) break :cp 0;
+        if (event.mods.ctrl or event.mods.alt or event.mods.super) break :cp 0;
+        if (event.utf8.len == 0) break :cp 0;
+
+        const seq = std.unicode.utf8ByteSequenceLength(event.utf8[0]) catch break :cp 0;
+        if (seq != event.utf8.len) break :cp 0;
+
+        const decoded = std.unicode.utf8Decode(event.utf8) catch break :cp 0;
+        if (decoded < 0x20 or decoded == 0x7f) break :cp 0;
+        break :cp decoded;
+    };
+
+    if (cp == 0) {
+        pred.flush();
+        return;
+    }
+
+    const t = self.io.terminal;
+
+    // Full-screen programs repaint rather than echo, so a character typed
+    // into one does not come back in any form we can match.
+    if (t.screens.active_key == .alternate) {
+        pred.flush();
+        return;
+    }
+
+    _ = pred.typed(
+        cp,
+        @intCast(t.screen.cursor.x),
+        @intCast(t.screen.cursor.y),
+        @intCast(t.cols),
+        state.predictionNow(),
+    );
 }
 
 /// Maybe handles a binding for a given event and if so returns the effect.

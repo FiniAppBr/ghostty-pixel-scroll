@@ -205,6 +205,25 @@ pub const StreamHandler = struct {
         // all actions encountered in real world scenarios.
         //
         // ref: https://github.com/qwerasd205/asciinema-stats
+
+        // Reconcile local echo predictions against what actually came
+        // back. A plain print either confirms the oldest prediction or
+        // proves it wrong; anything else moves the cursor in ways no
+        // prediction survives, so they are all abandoned. `action` is
+        // comptime, so this is one branch at each call site rather than a
+        // switch, and the length check makes it a load and a branch when
+        // nothing is predicted.
+        {
+            const pred = &self.renderer_state.prediction;
+            if (pred.len > 0) switch (action) {
+                .print => _ = pred.echoed(value.cp),
+                .print_slice => for (value.cps) |cp| {
+                    _ = pred.echoed(cp);
+                },
+                else => pred.flush(),
+            };
+        }
+
         switch (action) {
             .print => {
                 @branchHint(.likely);
