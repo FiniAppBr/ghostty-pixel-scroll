@@ -28,7 +28,7 @@ jobs:
     env:
       CI_LOG: ${{ github.workspace }}/../ci.log
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       # The Zig cache carries the compiled C/C++ dependencies, which change
       # only when build.zig.zon does. Restore-keys let a run start from the
