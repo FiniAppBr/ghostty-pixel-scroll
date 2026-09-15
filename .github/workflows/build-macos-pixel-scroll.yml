@@ -107,6 +107,27 @@ jobs:
           path: ghostty-macos-pixel-scroll.zip
           if-no-files-found: error
 
+      # Artifact downloads need API auth, which the dev machine doesn't
+      # have. Push the build itself to a branch so it can be fetched over
+      # plain git. Force-pushed each run, so only the latest is carried.
+      - name: Publish the build to ci-artifact branch
+        if: success()
+        run: |
+          set -e
+          WORK="$RUNNER_TEMP/artifact"
+          rm -rf "$WORK"; mkdir -p "$WORK"
+          cp ghostty-macos-pixel-scroll.zip "$WORK/"
+          cd "$WORK"
+          echo "${{ github.sha }}  run ${{ github.run_id }}  $(date -u +%FT%TZ)" > BUILD.txt
+          git init -q .
+          git checkout -q -b ci-artifact
+          git add -A
+          git -c user.name="ghostty-ci" -c user.email="ci@example.invalid" \
+            commit -q -m "build for ${{ github.sha }} (run ${{ github.run_id }})"
+          git push -q --force \
+            "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" \
+            ci-artifact
+
       # Report the outcome where a token-less machine can read it.
       - name: Publish result to ci-results branch
         if: always()
