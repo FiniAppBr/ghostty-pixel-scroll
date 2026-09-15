@@ -2939,8 +2939,19 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     std.math.maxInt(u16),
                     std.math.maxInt(u16),
                 };
-                self.cursor_last_pos = null;
-                self.cursor_corners.reset();
+
+                // If we leave without drawing a cursor — it is off screen,
+                // hidden, blinked out, or behind preedit text — forget where
+                // it was, so that it arrives without animating when it comes
+                // back rather than sliding in from wherever it used to be.
+                // Only then: clearing this unconditionally leaves every frame
+                // with nothing to measure the next move against, which is to
+                // say no animation at all.
+                var cursor_drawn = false;
+                defer if (!cursor_drawn) {
+                    self.cursor_last_pos = null;
+                    self.cursor_corners.reset();
+                };
 
                 // If the cursor isn't visible on the viewport, don't show
                 // a cursor. Otherwise, get our cursor cell, because we may
@@ -3001,11 +3012,79 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     break :cursor_color state.colors.foreground;
                 };
 
+                cursor_drawn = true;
                 self.addCursor(
                     &state.cursor,
                     style,
                     cursor_color,
                 );
+
+                // Smooth cursor motion: start the cursor at the cell it
+                // came from and let it catch up. The viewport scrolling
+                // also changes the cursor's viewport row without the
+                // cursor having moved, so that is subtracted out.
+                cursor_anim: {
+                    if (self.config.cursor_animation_duration <= 0) break :cursor_anim;
+
+                    // Track the cursor's absolute row, not its row on
+                    // screen. The grid slides under it — both when the
+                    // viewport scrolls and when a scroll animation lags
+                    // the snapshot — and none of that is the cursor
+                    // moving. Absolute rows are immune to both, and the
+                    // scroll spring animates the content's own movement.
+                    const vp_y = self.scroll_viewport_y orelse break :cursor_anim;
+
+                    // The snapshot starts above the viewport when a
+                    // scroll is in flight, so the cursor's row within
+                    // it is that many rows further down than the row
+                    // of the screen it is on.
+                    const screen_y: i64 = @as(i64, @intCast(cursor_vp.y)) -
+                        @as(i64, @intCast(self.terminal_state.rows_above));
+
+                    const pos: CursorPos = .{
+                        .x = @intCast(cursor_vp.x),
+                        .y = @as(i64, @intCast(vp_y)) + screen_y,
+                        .screen_y = screen_y,
+                    };
+                    defer self.cursor_last_pos = pos;
+
+                    const prev = self.cursor_last_pos orelse break :cursor_anim;
+
+                    const dx: i64 = pos.x - prev.x;
+                    const dy: i64 = pos.y - prev.y;
+                    if (dx == 0 and dy == 0) break :cursor_anim;
+
+                    const cw: f32 = @floatFromInt(self.grid_metrics.cell_width);
+                    const ch: f32 = @floatFromInt(self.grid_metrics.cell_height);
+
+                    // A cursor that held its row on screen while the
+                    // terminal scrolled under it was carried by the
+                    // grid: it is riding the line it sits on, which is
+                    // already gliding, so it travels in one piece and
+                    // over the same time rather than striking out on
+                    // its own and stretching. Output at the bottom of
+                    // the screen does this on every line.
+                    if (dx == 0 and pos.screen_y == prev.screen_y) {
+                        self.cursor_corners.follow(
+                            0,
+                            @floatFromInt(dy),
+                            cw,
+                            ch,
+                            if (self.config.pixel_scroll)
+                                self.config.scroll_animation_duration
+                            else
+                                self.config.cursor_animation_duration,
+                        );
+                    } else {
+                        self.cursor_corners.move(
+                            @floatFromInt(dx),
+                            @floatFromInt(dy),
+                            cw,
+                            ch,
+                            self.config.cursor_animation_duration,
+                        );
+                    }
+                }
 
                 // If the cursor is visible then we set our uniforms.
                 if (style == .block) {
@@ -3021,73 +3100,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         },
                         @intCast(cursor_vp.y),
                     };
-
-                    // Smooth cursor motion: start the cursor at the cell it
-                    // came from and let it catch up. The viewport scrolling
-                    // also changes the cursor's viewport row without the
-                    // cursor having moved, so that is subtracted out.
-                    cursor_anim: {
-                        if (self.config.cursor_animation_duration <= 0) break :cursor_anim;
-
-                        // Track the cursor's absolute row, not its row on
-                        // screen. The grid slides under it — both when the
-                        // viewport scrolls and when a scroll animation lags
-                        // the snapshot — and none of that is the cursor
-                        // moving. Absolute rows are immune to both, and the
-                        // scroll spring animates the content's own movement.
-                        const vp_y = self.scroll_viewport_y orelse break :cursor_anim;
-
-                        // The snapshot starts above the viewport when a
-                        // scroll is in flight, so the cursor's row within
-                        // it is that many rows further down than the row
-                        // of the screen it is on.
-                        const screen_y: i64 = @as(i64, @intCast(cursor_vp.y)) -
-                            @as(i64, @intCast(self.terminal_state.rows_above));
-
-                        const pos: CursorPos = .{
-                            .x = @intCast(cursor_vp.x),
-                            .y = @as(i64, @intCast(vp_y)) + screen_y,
-                            .screen_y = screen_y,
-                        };
-                        defer self.cursor_last_pos = pos;
-
-                        const prev = self.cursor_last_pos orelse break :cursor_anim;
-
-                        const dx: i64 = pos.x - prev.x;
-                        const dy: i64 = pos.y - prev.y;
-                        if (dx == 0 and dy == 0) break :cursor_anim;
-
-                        const cw: f32 = @floatFromInt(self.grid_metrics.cell_width);
-                        const ch: f32 = @floatFromInt(self.grid_metrics.cell_height);
-
-                        // A cursor that held its row on screen while the
-                        // terminal scrolled under it was carried by the
-                        // grid: it is riding the line it sits on, which is
-                        // already gliding, so it travels in one piece and
-                        // over the same time rather than striking out on
-                        // its own and stretching. Output at the bottom of
-                        // the screen does this on every line.
-                        if (dx == 0 and pos.screen_y == prev.screen_y) {
-                            self.cursor_corners.follow(
-                                0,
-                                @floatFromInt(dy),
-                                cw,
-                                ch,
-                                if (self.config.pixel_scroll)
-                                    self.config.scroll_animation_duration
-                                else
-                                    self.config.cursor_animation_duration,
-                            );
-                        } else {
-                            self.cursor_corners.move(
-                                @floatFromInt(dx),
-                                @floatFromInt(dy),
-                                cw,
-                                ch,
-                                self.config.cursor_animation_duration,
-                            );
-                        }
-                    }
 
                     self.uniforms.bools.cursor_wide = switch (wide) {
                         .narrow, .spacer_head => false,
