@@ -465,7 +465,9 @@ pub fn warmup() void {
             std.heap.c_allocator,
             device,
             &.{},
+            &.{},
             format,
+            custom_buffer_pixel_format,
         )) |s| {
             var s_mut = s;
             s_mut.deinit(std.heap.c_allocator);

@@ -1295,7 +1295,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 self.alloc.free(buffers);
             }
             for (declared) |decl| {
-                buffers[initialized] = try .init(self.alloc, self.api, decl.scale);
+                buffers[initialized] = try CustomBuffer.init(
+                    self.alloc,
+                    self.api,
+                    decl.scale,
+                );
                 initialized += 1;
             }
             return buffers;
@@ -1322,9 +1326,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         fn bindCustomChannels(
             self: *const Self,
             textures: *[4]?Texture,
-            terminal: Texture,
+            terminal_texture: Texture,
         ) void {
-            textures[0] = terminal;
+            textures[0] = terminal_texture;
             for (textures[1..], 0..) |*texture, i| {
                 texture.* = if (i < self.custom_buffers.len)
                     self.custom_buffers[i].back
@@ -2618,7 +2622,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     self.custom_passes,
                 ) |pipeline, info| {
                     const buf = &self.custom_buffers[info.target];
-                    for (0..info.repeat) |_| {
+                    for (0..@as(usize, info.repeat)) |_| {
                         defer buf.swap();
 
                         self.bindCustomChannels(&textures, state.back_texture);
