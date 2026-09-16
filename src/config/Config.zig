@@ -3315,6 +3315,47 @@ keybind: Keybinds = .{},
 /// depending on the shader and your terminal usage.
 ///
 /// This can be changed at runtime and will affect all open terminals.
+/// Declare a persistent offscreen buffer that custom shaders can read and
+/// write across frames.
+///
+/// Ghostty's shader chain is otherwise stateless: each pass sees only what the
+/// previous pass produced this frame, which is enough for a filter but not for
+/// anything that has to remember, such as a fluid simulation, a reaction
+/// diffusion or a trail that outlives one frame.
+///
+/// The format is `<name>:<scale>`, where scale is a fraction of the window
+/// size. Simulations are usually run well below screen resolution, so
+/// `sim:0.125` gives a buffer an eighth as wide and an eighth as tall.
+///
+/// Buffers are bound to channels in the order declared: the first becomes
+/// `iChannel1`, the second `iChannel2`, the third `iChannel3`. `iChannel0` is
+/// always the terminal image, as it is today. At most three may be declared.
+///
+/// Each buffer is double-buffered. A pass reads the previous contents through
+/// its channel and writes the next, so reading and writing the same buffer in
+/// one pass is well defined.
+///
+/// Buffers are RGBA16F, cleared to zero when created or resized.
+///
+/// This can be changed at runtime and will affect all open terminals.
+@"custom-shader-buffer": RepeatableShaderBuffer = .{},
+
+/// Run a shader into one of the buffers declared by `custom-shader-buffer`.
+///
+/// The format is `<buffer>:<path>` or `<buffer>:<path>:<repeat>`. Passes run
+/// in the order given, before any `custom-shader` entries, and none of them
+/// draw to the screen. The repeat count runs the same shader that many times
+/// in sequence, which is how an iterative solve (a Jacobi pressure solve, for
+/// instance) is expressed without inventing a loop syntax.
+///
+/// A pass renders at its target buffer's resolution, so `iResolution` is the
+/// window size while the pass's own size comes from `textureSize`.
+///
+/// Paths must be absolute.
+///
+/// This can be changed at runtime and will affect all open terminals.
+@"custom-shader-pass": RepeatableShaderPass = .{},
+
 @"custom-shader-animation": CustomShaderAnimation = .true,
 
 /// Bell features to enable if bell support is available in your runtime. Not
@@ -6283,6 +6324,276 @@ pub const Palette = struct {
 /// a list of strings. This isn't called "StringList" because I find that
 /// sometimes leads to confusion that it _accepts_ a list such as
 /// comma-separated values.
+/// A persistent offscreen buffer available to custom shaders.
+pub const ShaderBuffer = struct {
+    name: [:0]const u8,
+    scale: f32,
+};
+
+pub const RepeatableShaderBuffer = struct {
+    const Self = @This();
+
+    /// At most three: iChannel1 through iChannel3. iChannel0 is the terminal.
+    pub const max = 3;
+
+    list: std.ArrayList(ShaderBuffer) = .empty,
+
+    pub fn parseCLI(self: *Self, alloc: Allocator, input: ?[]const u8) !void {
+        const value = input orelse return error.ValueRequired;
+        if (value.len == 0) {
+            self.list.clearRetainingCapacity();
+            return;
+        }
+
+        var it = std.mem.splitScalar(u8, value, ':');
+        const name = it.next() orelse return error.InvalidValue;
+        const scale_raw = it.next() orelse return error.InvalidValue;
+        if (it.next() != null) return error.InvalidValue;
+        if (name.len == 0) return error.InvalidValue;
+
+        const scale = std.fmt.parseFloat(f32, scale_raw) catch return error.InvalidValue;
+        // A zero or negative scale has no pixels and a scale above one costs
+        // more than the screen without buying anything a full-size pass could
+        // not do.
+        if (!(scale > 0.0) or scale > 1.0) return error.InvalidValue;
+
+        if (self.list.items.len >= max) return error.InvalidValue;
+        for (self.list.items) |item| {
+            if (std.mem.eql(u8, item.name, name)) return error.InvalidValue;
+        }
+
+        try self.list.append(alloc, .{
+            .name = try alloc.dupeZ(u8, name),
+            .scale = scale,
+        });
+    }
+
+    /// The channel index this buffer is bound to (1-3), or null if unknown.
+    pub fn channel(self: Self, name: []const u8) ?usize {
+        for (self.list.items, 1..) |item, i| {
+            if (std.mem.eql(u8, item.name, name)) return i;
+        }
+        return null;
+    }
+
+    /// Deep copy of the struct. Required by Config.
+    pub fn clone(self: *const Self, alloc: Allocator) Allocator.Error!Self {
+        var list = try std.ArrayList(ShaderBuffer).initCapacity(alloc, self.list.items.len);
+        errdefer list.deinit(alloc);
+        for (self.list.items) |item| {
+            list.appendAssumeCapacity(.{
+                .name = try alloc.dupeZ(u8, item.name),
+                .scale = item.scale,
+            });
+        }
+        return .{ .list = list };
+    }
+
+    /// Compare if two of our value are equal. Required by Config.
+    pub fn equal(self: Self, other: Self) bool {
+        if (self.list.items.len != other.list.items.len) return false;
+        for (self.list.items, other.list.items) |a, b| {
+            if (!std.mem.eql(u8, a.name, b.name)) return false;
+            if (a.scale != b.scale) return false;
+        }
+        return true;
+    }
+
+    /// Used by Formatter
+    pub fn formatEntry(self: Self, formatter: formatterpkg.EntryFormatter) !void {
+        if (self.list.items.len == 0) {
+            try formatter.formatEntry(void, {});
+            return;
+        }
+        var buf: [std.fs.max_path_bytes + 64]u8 = undefined;
+        for (self.list.items) |item| {
+            const v = std.fmt.bufPrint(&buf, "{s}:{d}", .{ item.name, item.scale }) catch return error.OutOfMemory;
+            try formatter.formatEntry([]const u8, v);
+        }
+    }
+
+    test "parseCLI" {
+        const testing = std.testing;
+        var arena = ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+
+        var list: Self = .{};
+        try list.parseCLI(alloc, "sim:0.125");
+        try list.parseCLI(alloc, "dye:0.5");
+        try testing.expectEqual(@as(usize, 2), list.list.items.len);
+        try testing.expectEqual(@as(f32, 0.125), list.list.items[0].scale);
+        try testing.expectEqual(@as(?usize, 1), list.channel("sim"));
+        try testing.expectEqual(@as(?usize, 2), list.channel("dye"));
+        try testing.expectEqual(@as(?usize, null), list.channel("nope"));
+
+        try list.parseCLI(alloc, "");
+        try testing.expectEqual(@as(usize, 0), list.list.items.len);
+    }
+
+    test "parseCLI rejects bad input" {
+        const testing = std.testing;
+        var arena = ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+
+        var list: Self = .{};
+        try testing.expectError(error.InvalidValue, list.parseCLI(alloc, "sim"));
+        try testing.expectError(error.InvalidValue, list.parseCLI(alloc, "sim:0"));
+        try testing.expectError(error.InvalidValue, list.parseCLI(alloc, "sim:-1"));
+        try testing.expectError(error.InvalidValue, list.parseCLI(alloc, "sim:2"));
+        try testing.expectError(error.InvalidValue, list.parseCLI(alloc, "sim:x"));
+        try testing.expectError(error.InvalidValue, list.parseCLI(alloc, "sim:0.5:extra"));
+        try testing.expectError(error.InvalidValue, list.parseCLI(alloc, ":0.5"));
+
+        // duplicate names would make the channel mapping ambiguous
+        try list.parseCLI(alloc, "sim:0.5");
+        try testing.expectError(error.InvalidValue, list.parseCLI(alloc, "sim:0.25"));
+    }
+
+    test "parseCLI enforces the channel limit" {
+        const testing = std.testing;
+        var arena = ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+
+        var list: Self = .{};
+        try list.parseCLI(alloc, "a:0.5");
+        try list.parseCLI(alloc, "b:0.5");
+        try list.parseCLI(alloc, "c:0.5");
+        try testing.expectError(error.InvalidValue, list.parseCLI(alloc, "d:0.5"));
+    }
+};
+
+/// One shader run into a buffer, before the visible chain.
+pub const ShaderPass = struct {
+    target: [:0]const u8,
+    path: [:0]const u8,
+    repeat: u8 = 1,
+};
+
+pub const RepeatableShaderPass = struct {
+    const Self = @This();
+
+    list: std.ArrayList(ShaderPass) = .empty,
+
+    pub fn parseCLI(self: *Self, alloc: Allocator, input: ?[]const u8) !void {
+        const value = input orelse return error.ValueRequired;
+        if (value.len == 0) {
+            self.list.clearRetainingCapacity();
+            return;
+        }
+
+        // target:path[:repeat]. The path can itself contain colons on some
+        // systems, so split the target off the front and the repeat off the
+        // back rather than splitting the whole thing.
+        const first = std.mem.indexOfScalar(u8, value, ':') orelse return error.InvalidValue;
+        const target = value[0..first];
+        if (target.len == 0) return error.InvalidValue;
+
+        var rest = value[first + 1 ..];
+        var repeat: u8 = 1;
+        if (std.mem.lastIndexOfScalar(u8, rest, ':')) |last| {
+            if (std.fmt.parseInt(u8, rest[last + 1 ..], 10)) |n| {
+                if (n == 0) return error.InvalidValue;
+                repeat = n;
+                rest = rest[0..last];
+            } else |_| {}
+        }
+        if (rest.len == 0) return error.InvalidValue;
+        if (!std.fs.path.isAbsolute(rest)) return error.InvalidValue;
+
+        try self.list.append(alloc, .{
+            .target = try alloc.dupeZ(u8, target),
+            .path = try alloc.dupeZ(u8, rest),
+            .repeat = repeat,
+        });
+    }
+
+    /// Total number of shader runs, which is what the renderer allocates.
+    pub fn runs(self: Self) usize {
+        var n: usize = 0;
+        for (self.list.items) |item| n += item.repeat;
+        return n;
+    }
+
+    /// Deep copy of the struct. Required by Config.
+    pub fn clone(self: *const Self, alloc: Allocator) Allocator.Error!Self {
+        var list = try std.ArrayList(ShaderPass).initCapacity(alloc, self.list.items.len);
+        errdefer list.deinit(alloc);
+        for (self.list.items) |item| {
+            list.appendAssumeCapacity(.{
+                .target = try alloc.dupeZ(u8, item.target),
+                .path = try alloc.dupeZ(u8, item.path),
+                .repeat = item.repeat,
+            });
+        }
+        return .{ .list = list };
+    }
+
+    /// Compare if two of our value are equal. Required by Config.
+    pub fn equal(self: Self, other: Self) bool {
+        if (self.list.items.len != other.list.items.len) return false;
+        for (self.list.items, other.list.items) |a, b| {
+            if (!std.mem.eql(u8, a.target, b.target)) return false;
+            if (!std.mem.eql(u8, a.path, b.path)) return false;
+            if (a.repeat != b.repeat) return false;
+        }
+        return true;
+    }
+
+    /// Used by Formatter
+    pub fn formatEntry(self: Self, formatter: formatterpkg.EntryFormatter) !void {
+        if (self.list.items.len == 0) {
+            try formatter.formatEntry(void, {});
+            return;
+        }
+        var buf: [std.fs.max_path_bytes + 64]u8 = undefined;
+        for (self.list.items) |item| {
+            const v = std.fmt.bufPrint(&buf, "{s}:{s}:{d}", .{
+                item.target, item.path, item.repeat,
+            }) catch return error.OutOfMemory;
+            try formatter.formatEntry([]const u8, v);
+        }
+    }
+
+    test "parseCLI" {
+        const testing = std.testing;
+        var arena = ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+
+        var list: Self = .{};
+        try list.parseCLI(alloc, "sim:/tmp/a.glsl");
+        try testing.expectEqual(@as(usize, 1), list.list.items.len);
+        try testing.expectEqualStrings("sim", list.list.items[0].target);
+        try testing.expectEqualStrings("/tmp/a.glsl", list.list.items[0].path);
+        try testing.expectEqual(@as(u8, 1), list.list.items[0].repeat);
+
+        try list.parseCLI(alloc, "sim:/tmp/b.glsl:20");
+        try testing.expectEqual(@as(u8, 20), list.list.items[1].repeat);
+        try testing.expectEqualStrings("/tmp/b.glsl", list.list.items[1].path);
+        try testing.expectEqual(@as(usize, 21), list.runs());
+
+        try list.parseCLI(alloc, "");
+        try testing.expectEqual(@as(usize, 0), list.list.items.len);
+    }
+
+    test "parseCLI rejects bad input" {
+        const testing = std.testing;
+        var arena = ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+
+        var list: Self = .{};
+        try testing.expectError(error.InvalidValue, list.parseCLI(alloc, "noseparator"));
+        try testing.expectError(error.InvalidValue, list.parseCLI(alloc, ":/tmp/a.glsl"));
+        try testing.expectError(error.InvalidValue, list.parseCLI(alloc, "sim:"));
+        try testing.expectError(error.InvalidValue, list.parseCLI(alloc, "sim:relative.glsl"));
+        try testing.expectError(error.InvalidValue, list.parseCLI(alloc, "sim:/tmp/a.glsl:0"));
+    }
+};
+
 pub const RepeatableString = struct {
     const Self = @This();
 

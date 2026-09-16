@@ -12,7 +12,7 @@ name: Build macOS (pixel-scroll, unsigned)
 on:
   workflow_dispatch:
   push:
-    branches: [pixel-scroll]
+    branches: [pixel-scroll, fluid]
 
 # A newer push makes an in-flight build pointless; macOS minutes bill at
 # 10x so it's worth not paying for both.
