@@ -1108,6 +1108,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .selection_foreground_color = @splat(0),
                     .write_head = @splat(0),
                     .write_head_time = 0,
+                    .scroll_velocity = 0,
                 },
                 .bg_image_buffer = undefined,
 
@@ -1557,14 +1558,27 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// timer off this, re-querying after every wake.
         ///
         /// Must be called on the render thread.
+        /// How many draw intervals an unfocused surface waits between
+        /// shader frames under `custom-shader-animation = always`.
+        const unfocused_animation_divisor: u64 = 4;
+
         pub fn animationWake(self: *const Self) ?AnimationWake {
             // Custom shaders animate by redrawing on a fixed cadence,
             // gated by configuration and focus.
+            //
+            // An unfocused surface under `always` still animates, but at
+            // a quarter of the rate: the eye is elsewhere, so a slower
+            // cadence there reads as the same motion for a fraction of
+            // the GPU time, and a window of splits stays close to the
+            // cost of one.
             const shader_delay: ?u64 = shader: {
                 if (!self.has_custom_shaders) break :shader null;
                 break :shader switch (self.config.custom_shader_animation) {
                     .false => null,
-                    .always => draw_interval_ms,
+                    .always => if (self.focused)
+                        draw_interval_ms
+                    else
+                        draw_interval_ms * unfocused_animation_divisor,
                     .true => if (self.focused) draw_interval_ms else null,
                 };
             };
@@ -2877,7 +2891,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 self.target_config_modified +%= 1;
             }
 
-            if (custom_shaders_changed) {
+            // A shader file edited in place has the same path, so comparing
+            // the config alone would miss it. Recompiling is cheap next to
+            // how rarely the config is reloaded, so any reload with custom
+            // shaders configured rebuilds them and picks up the edit.
+            const wants_custom_shaders =
+                config.custom_shaders.value.items.len > 0 or
+                config.custom_shader_passes.list.items.len > 0;
+            if (custom_shaders_changed or wants_custom_shaders) {
                 self.reinitialize_shaders = true;
             }
         }
@@ -3382,6 +3403,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 }
                 uniforms.write_head = rect;
             }
+
+            // The spring's velocity is the rate of the grid offset, which
+            // is measured downwards; flip it for an API whose custom
+            // shader y axis points up so the sign matches the rectangles.
+            uniforms.scroll_velocity = if (GraphicsAPI.custom_shader_y_is_down)
+                self.scroll_spring.velocity
+            else
+                -self.scroll_spring.velocity;
 
             // Update focus uniforms
             uniforms.focus = @intFromBool(self.focused);

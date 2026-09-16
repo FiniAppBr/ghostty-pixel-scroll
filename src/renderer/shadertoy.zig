@@ -47,6 +47,13 @@ pub const Uniforms = extern struct {
     /// this instead. Same shape as the cursor rectangle.
     write_head: [4]f32 align(16),
     write_head_time: f32 align(4),
+
+    /// How fast the grid is sliding under a smooth scroll, in pixels per
+    /// second along the same y axis as the cursor rectangle. Zero when the
+    /// grid is settled. A shader that treats glyphs as solid can give them
+    /// this velocity instead of none, so scrolling text carries what is
+    /// around it rather than cutting through it.
+    scroll_velocity: f32 align(4),
 };
 
 /// The target to load shaders for.

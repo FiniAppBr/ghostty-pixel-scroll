@@ -104,6 +104,7 @@ jobs:
               -Dtest-filter=prediction \
               -Dtest-filter=animation \
               -Dtest-filter=cursor_rect \
+              -Dtest-filter=RepeatableShader \
               -Doptimize=Debug
             echo "tests passed"
           } 2>&1 | tee -a "$CI_LOG"
