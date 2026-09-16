@@ -9,10 +9,13 @@ name: Build macOS (pixel-scroll, unsigned)
 # branch. That's so the result can be read over plain git (`git fetch`),
 # without a GitHub token, from a machine that only has SSH access.
 
+# Manual only. A push used to trigger this, which meant every commit spent
+# macOS minutes -- and those bill at 10x. Everything except the .app itself
+# can be checked locally now (see PORT-STATUS.md), so a build is something
+# to ask for deliberately, from the Actions tab, not something that happens
+# because a branch moved.
 on:
   workflow_dispatch:
-  push:
-    branches: [pixel-scroll, fluid]
 
 # A newer push makes an in-flight build pointless; macOS minutes bill at
 # 10x so it's worth not paying for both.
@@ -23,6 +26,9 @@ concurrency:
 jobs:
   build:
     runs-on: macos-latest
+    # Without this a stuck job runs to GitHub's 6 hour default, which at the
+    # 10x macOS multiplier is 3,600 billed minutes from one hang.
+    timeout-minutes: 45
     permissions:
       contents: write
     env:
