@@ -81,6 +81,16 @@ pub fn step(self: *Self, s: Step) void {
     };
     defer fbobind.unbind();
 
+    // Match the viewport to whatever we're drawing into. The viewport is
+    // global state otherwise left over from the last resize, which is the
+    // screen size, and a pass that renders into an offscreen buffer is
+    // usually a fraction of that.
+    const size: struct { usize, usize } = switch (self.attachments[0].target) {
+        .target => |t| .{ t.width, t.height },
+        .texture => |t| .{ t.width, t.height },
+    };
+    gl.viewport(0, 0, @intCast(size[0]), @intCast(size[1])) catch return;
+
     defer self.step_number += 1;
 
     // If we have a clear color and this is the

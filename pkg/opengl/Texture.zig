@@ -83,6 +83,11 @@ pub const InternalFormat = enum(c_int) {
     srgb = c.GL_SRGB8,
     srgba = c.GL_SRGB8_ALPHA8,
 
+    /// GL_RGBA16F. Half float, so it can hold values outside of [0, 1] and
+    /// does not carry a transfer function. Used for offscreen buffers that
+    /// store quantities rather than colors.
+    rgba16f = 0x881A,
+
     rgba_compressed = c.GL_COMPRESSED_RGBA_BPTC_UNORM,
     srgba_compressed = c.GL_COMPRESSED_SRGB_ALPHA_BPTC_UNORM,
 

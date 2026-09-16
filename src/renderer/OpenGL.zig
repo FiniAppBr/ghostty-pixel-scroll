@@ -267,11 +267,13 @@ pub fn initShaders(
     self: *const OpenGL,
     alloc: Allocator,
     custom_shaders: []const [:0]const u8,
+    buffer_shaders: []const [:0]const u8,
 ) !shaders.Shaders {
     _ = alloc;
     return try shaders.Shaders.init(
         self.alloc,
         custom_shaders,
+        buffer_shaders,
     );
 }
 
@@ -356,6 +358,32 @@ pub inline fn textureOptions(self: OpenGL) Texture.Options {
         .wrap_s = .clamp_to_edge,
         .wrap_t = .clamp_to_edge,
     };
+}
+
+/// Returns the options to use when constructing the persistent buffers
+/// declared by `custom-shader-buffer`. These hold quantities rather than
+/// colors -- a velocity field, a pressure, a density -- so they are float
+/// and carry no transfer function, unlike every other texture we render to.
+pub inline fn bufferTextureOptions(self: OpenGL) Texture.Options {
+    _ = self;
+    return .{
+        .format = .rgba,
+        .internal_format = .rgba16f,
+        .target = .@"2d",
+        .min_filter = .linear,
+        .mag_filter = .linear,
+        .wrap_s = .clamp_to_edge,
+        .wrap_t = .clamp_to_edge,
+    };
+}
+
+/// How many bytes of image data a buffer texture of this size takes, so
+/// that it can be created zeroed. Texture uploads always go through as
+/// unsigned bytes whatever the internal format is, so this does not follow
+/// from the pixel format the way it does on Metal.
+pub inline fn bufferTextureBytes(self: OpenGL, width: usize, height: usize) usize {
+    _ = self;
+    return width * height * 4;
 }
 
 /// Returns the options to use when constructing samplers.

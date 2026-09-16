@@ -196,11 +196,13 @@ pub fn initShaders(
     self: *const Metal,
     alloc: Allocator,
     custom_shaders: []const [:0]const u8,
+    buffer_shaders: []const [:0]const u8,
 ) !shaders.Shaders {
     return try shaders.Shaders.init(
         alloc,
         self.device,
         custom_shaders,
+        buffer_shaders,
         // Using an `*_srgb` pixel format makes Metal gamma encode
         // the pixels written to it *after* blending, which means
         // we get linear alpha blending rather than gamma-incorrect
@@ -209,8 +211,15 @@ pub fn initShaders(
             mtl.MTLPixelFormat.bgra8unorm_srgb
         else
             mtl.MTLPixelFormat.bgra8unorm,
+        custom_buffer_pixel_format,
     );
 }
+
+/// Pixel format for the persistent buffers declared by
+/// `custom-shader-buffer`. These hold quantities rather than colors -- a
+/// velocity field, a pressure, a density -- so they are float and carry no
+/// transfer function, unlike every other texture we render to.
+const custom_buffer_pixel_format: mtl.MTLPixelFormat = .rgba16float;
 
 /// Get the current size of the runtime surface.
 pub fn surfaceSize(self: *const Metal) !struct { width: u32, height: u32 } {
@@ -303,6 +312,32 @@ pub inline fn textureOptions(self: Metal) Texture.Options {
             .render_target = true,
         },
     };
+}
+
+/// Returns the options to use when constructing the persistent buffers
+/// declared by `custom-shader-buffer`.
+pub inline fn bufferTextureOptions(self: Metal) Texture.Options {
+    return .{
+        .device = self.device,
+        .pixel_format = custom_buffer_pixel_format,
+        .resource_options = .{
+            .cpu_cache_mode = .write_combined,
+            .storage_mode = self.default_storage_mode,
+        },
+        .usage = .{
+            // Read by later passes, written by the pass that targets it.
+            .shader_read = true,
+            .render_target = true,
+        },
+    };
+}
+
+/// How many bytes of image data a buffer texture of this size takes, so
+/// that it can be created zeroed.
+pub inline fn bufferTextureBytes(self: Metal, width: usize, height: usize) usize {
+    _ = self;
+    // rgba16float
+    return width * height * 8;
 }
 
 pub inline fn samplerOptions(self: Metal) Sampler.Options {

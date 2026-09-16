@@ -249,6 +249,21 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// Our shader pipelines.
         shaders: Shaders,
 
+        /// The persistent buffers declared by `custom-shader-buffer`, in the
+        /// order declared: the first is bound to `iChannel1`, and so on.
+        /// Owned here rather than by the swap chain because they carry state
+        /// from one frame to the next.
+        custom_buffers: []CustomBuffer = &.{},
+
+        /// One entry per pipeline in `shaders.buffer_pipelines`, saying
+        /// which buffer it draws into and how many times it runs.
+        custom_passes: []CustomPass = &.{},
+
+        /// A 1x1 black texture for any channel with no buffer behind it.
+        /// The shader prefix declares all four channels unconditionally and
+        /// a texture argument a shader declares has to be bound.
+        empty_texture: ?Texture = null,
+
         /// The render state we update per loop.
         terminal_state: terminal.RenderState = .empty,
 
@@ -615,6 +630,128 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             }
         };
 
+        /// A persistent offscreen buffer that custom shader passes read and
+        /// write across frames, declared by `custom-shader-buffer`.
+        ///
+        /// Unlike `CustomShaderState` there is exactly one of these per
+        /// declared buffer, not one per frame in flight. Carrying state from
+        /// one frame to the next is the entire point of them, so they cannot
+        /// live in the swap chain.
+        const CustomBuffer = struct {
+            /// A pass reads `back` and renders into `front`, and we swap
+            /// once it has run. That is what makes a pass that reads and
+            /// writes the same buffer -- which is what advection is -- well
+            /// defined.
+            front: Texture,
+            back: Texture,
+
+            /// Fraction of the screen size to allocate at. Simulations run
+            /// well below screen resolution, which is what makes a solve of
+            /// a dozen passes affordable at all.
+            scale: f32,
+
+            /// Currently allocated size. Zero means the textures are still
+            /// placeholders and have to be sized before they are used.
+            width: usize = 0,
+            height: usize = 0,
+
+            pub fn init(
+                alloc: Allocator,
+                api: GraphicsAPI,
+                scale: f32,
+            ) !CustomBuffer {
+                const front = try zeroTexture(alloc, api, 1, 1);
+                errdefer front.deinit();
+                const back = try zeroTexture(alloc, api, 1, 1);
+                errdefer back.deinit();
+                return .{ .front = front, .back = back, .scale = scale };
+            }
+
+            /// A texture of the given size filled with zeroes.
+            ///
+            /// Buffers have to start from a known value rather than from
+            /// whatever was in that memory: a pass that reads its own buffer
+            /// feeds what it finds there back into itself every frame, so
+            /// nothing ever washes it out. We fill at creation instead of
+            /// clearing in a render pass because a pass with no draw in it
+            /// does nothing at all under OpenGL.
+            fn zeroTexture(
+                alloc: Allocator,
+                api: GraphicsAPI,
+                width: usize,
+                height: usize,
+            ) !Texture {
+                const zeroes = try alloc.alloc(
+                    u8,
+                    api.bufferTextureBytes(width, height),
+                );
+                defer alloc.free(zeroes);
+                @memset(zeroes, 0);
+                return try Texture.init(
+                    api.bufferTextureOptions(),
+                    width,
+                    height,
+                    zeroes,
+                );
+            }
+
+            pub fn deinit(self: *CustomBuffer) void {
+                self.front.deinit();
+                self.back.deinit();
+            }
+
+            /// Swap the front and back textures.
+            pub fn swap(self: *CustomBuffer) void {
+                std.mem.swap(Texture, &self.front, &self.back);
+            }
+
+            /// Size this buffer for the given screen size. Does nothing if
+            /// it is already the right size.
+            pub fn resize(
+                self: *CustomBuffer,
+                alloc: Allocator,
+                api: GraphicsAPI,
+                screen_width: usize,
+                screen_height: usize,
+            ) !void {
+                const width = scaled(screen_width, self.scale);
+                const height = scaled(screen_height, self.scale);
+                if (width == self.width and height == self.height) return;
+
+                const front = try zeroTexture(alloc, api, width, height);
+                errdefer front.deinit();
+                const back = try zeroTexture(alloc, api, width, height);
+                errdefer back.deinit();
+
+                self.front.deinit();
+                self.back.deinit();
+
+                self.front = front;
+                self.back = back;
+                self.width = width;
+                self.height = height;
+            }
+
+            fn scaled(px: usize, scale: f32) usize {
+                const v: f32 = @floatFromInt(px);
+                const n: f32 = @round(v * scale);
+                if (!(n >= 1.0)) return 1;
+                return @intFromFloat(n);
+            }
+        };
+
+        /// One entry of `custom-shader-pass`, resolved. This is parallel to
+        /// `shaders.buffer_pipelines`: entry N here describes pipeline N.
+        const CustomPass = struct {
+            /// Index into `custom_buffers`.
+            target: usize,
+
+            /// How many times in a row to run it. An iterative solve is a
+            /// repeat count rather than a loop because a pass cannot read
+            /// what it is currently writing.
+            repeat: u8,
+        };
+
         /// What each row of the grid gained since we last looked at it,
         /// which is what fades in.
         ///
@@ -750,6 +887,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             min_contrast: f32,
             padding_color: configpkg.WindowPaddingColor,
             custom_shaders: configpkg.RepeatablePath,
+            custom_shader_buffers: configpkg.Config.RepeatableShaderBuffer,
+            custom_shader_passes: configpkg.Config.RepeatableShaderPass,
             bg_image: ?configpkg.Path,
             bg_image_opacity: f32,
             bg_image_position: configpkg.BackgroundImagePosition,
@@ -780,6 +919,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
                 // Copy our shaders
                 const custom_shaders = try config.@"custom-shader".clone(alloc);
+                const custom_shader_buffers =
+                    try config.@"custom-shader-buffer".clone(alloc);
+                const custom_shader_passes =
+                    try config.@"custom-shader-pass".clone(alloc);
 
                 // Copy our background image
                 const bg_image =
@@ -832,6 +975,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .search_selected_foreground = config.@"search-selected-foreground",
 
                     .custom_shaders = custom_shaders,
+                    .custom_shader_buffers = custom_shader_buffers,
+                    .custom_shader_passes = custom_shader_passes,
                     .bg_image = bg_image,
                     .bg_image_opacity = config.@"background-image-opacity",
                     .bg_image_position = config.@"background-image-position",
@@ -1037,14 +1182,155 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             const has_custom_shaders = custom_shaders.len > 0;
 
+            // Load the buffer passes. These only make sense underneath a
+            // visible chain, since nothing else ever reads what they write.
+            var pass_sources: std.ArrayList([:0]const u8) = .empty;
+            var passes: std.ArrayList(CustomPass) = .empty;
+            defer passes.deinit(self.alloc);
+            if (has_custom_shaders) self.loadCustomPasses(
+                arena_alloc,
+                &pass_sources,
+                &passes,
+            ) catch |err| {
+                // All or nothing. A solve missing one of its steps is not a
+                // degraded solve, it is a broken one, and the shaders that
+                // read the buffers behave sensibly when they are empty.
+                log.warn("error loading custom shader passes err={}", .{err});
+                pass_sources.clearRetainingCapacity();
+                passes.clearRetainingCapacity();
+            };
+
             var shaders = try self.api.initShaders(
                 self.alloc,
                 custom_shaders,
+                pass_sources.items,
             );
             errdefer shaders.deinit(self.alloc);
 
+            // The shader set drops all of its buffer pipelines if any of
+            // them failed to build, and our metadata has to stay in step
+            // with it since we walk the two together.
+            if (shaders.buffer_pipelines.len != passes.items.len) {
+                passes.clearRetainingCapacity();
+            }
+
+            const buffers = try self.initCustomBuffers(passes.items.len > 0);
+            errdefer {
+                for (buffers) |*buf| buf.deinit();
+                self.alloc.free(buffers);
+            }
+
+            const empty_texture: ?Texture = if (buffers.len > 0)
+                try Texture.init(
+                    self.api.textureOptions(),
+                    1,
+                    1,
+                    &[_]u8{ 0, 0, 0, 0 },
+                )
+            else
+                null;
+            errdefer if (empty_texture) |texture| texture.deinit();
+
+            const custom_passes = try passes.toOwnedSlice(self.alloc);
+
+            self.releaseCustomBuffers();
+            self.custom_buffers = buffers;
+            self.custom_passes = custom_passes;
+            self.empty_texture = empty_texture;
             self.shaders = shaders;
             self.has_custom_shaders = has_custom_shaders;
+        }
+
+        /// Load the shader for every `custom-shader-pass` entry and resolve
+        /// its target to an index into `custom_buffers`. Errors if a pass
+        /// names a buffer that was never declared, since a pass with nowhere
+        /// to draw is a config mistake rather than a missing feature.
+        fn loadCustomPasses(
+            self: *Self,
+            alloc: Allocator,
+            sources: *std.ArrayList([:0]const u8),
+            passes: *std.ArrayList(CustomPass),
+        ) !void {
+            for (self.config.custom_shader_passes.list.items) |item| {
+                const channel =
+                    self.config.custom_shader_buffers.channel(item.target) orelse {
+                        log.warn(
+                            "custom shader pass targets a buffer that was not declared name={s}",
+                            .{item.target},
+                        );
+                        return error.UndeclaredShaderBuffer;
+                    };
+
+                const source = try shadertoy.loadFromFile(
+                    alloc,
+                    item.path,
+                    GraphicsAPI.custom_shader_target,
+                );
+                try sources.append(alloc, source);
+                try passes.append(self.alloc, .{
+                    // `channel` is 1-based because it names iChannelN.
+                    .target = channel - 1,
+                    .repeat = item.repeat,
+                });
+
+                log.info("loaded custom shader pass target={s} path={s}", .{
+                    item.target,
+                    item.path,
+                });
+            }
+        }
+
+        /// Create the buffers declared by `custom-shader-buffer`. They start
+        /// at 1x1 and are sized to the screen on the next frame, as all of
+        /// our other textures are. Returns an empty slice when no pass will
+        /// ever write to them.
+        fn initCustomBuffers(self: *Self, wanted: bool) ![]CustomBuffer {
+            const declared = self.config.custom_shader_buffers.list.items;
+            if (!wanted or declared.len == 0) return &.{};
+
+            const buffers = try self.alloc.alloc(CustomBuffer, declared.len);
+            var initialized: usize = 0;
+            errdefer {
+                for (buffers[0..initialized]) |*buf| buf.deinit();
+                self.alloc.free(buffers);
+            }
+            for (declared) |decl| {
+                buffers[initialized] = try .init(self.alloc, self.api, decl.scale);
+                initialized += 1;
+            }
+            return buffers;
+        }
+
+        /// Free the custom shader buffers along with the pass list that
+        /// indexes into them. The two are always built and dropped together.
+        fn releaseCustomBuffers(self: *Self) void {
+            for (self.custom_buffers) |*buf| buf.deinit();
+            self.alloc.free(self.custom_buffers);
+            self.custom_buffers = &.{};
+
+            self.alloc.free(self.custom_passes);
+            self.custom_passes = &.{};
+
+            if (self.empty_texture) |texture| texture.deinit();
+            self.empty_texture = null;
+        }
+
+        /// Fill in the texture bindings a custom shader sees: `iChannel0` is
+        /// the terminal image and `iChannel1` onwards are the declared
+        /// buffers, read side. Channels with no buffer behind them get the
+        /// 1x1 black texture.
+        fn bindCustomChannels(
+            self: *const Self,
+            textures: *[4]?Texture,
+            terminal: Texture,
+        ) void {
+            textures[0] = terminal;
+            for (textures[1..], 0..) |*texture, i| {
+                texture.* = if (i < self.custom_buffers.len)
+                    self.custom_buffers[i].back
+                else
+                    self.empty_texture;
+            }
         }
 
         /// Callback called by renderer.Thread when it begins.
@@ -1394,9 +1680,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 self.swap_chain = null;
             }
 
-            // Release the shaders as well if we're unrealized.
+            // Release the shaders as well if we're unrealized. The custom
+            // shader buffers go with them: the passes that write them are
+            // pipelines in that same set, and the two are always rebuilt
+            // together by `initShaders`.
             if (!self.display_realized) {
                 self.shaders.deinit(self.alloc);
+                self.releaseCustomBuffers();
             }
         }
 
@@ -2127,6 +2417,16 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 frame.target_config_modified = self.target_config_modified;
             }
 
+            // Size our persistent shader buffers to the screen. These belong
+            // to the renderer rather than the frame, so they are not part of
+            // the frame resize above.
+            for (self.custom_buffers) |*buf| try buf.resize(
+                self.alloc,
+                self.api,
+                self.size.screen.width,
+                self.size.screen.height,
+            );
+
             // Upload images to the GPU as necessary.
             _ = self.images.upload(self.alloc, &self.api);
 
@@ -2293,8 +2593,59 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // Sync our uniforms.
                 try state.uniforms.sync(&.{self.custom_shader_uniforms});
 
+                // Every custom shader pass sees the same four channels. We
+                // bind all four whether or not a buffer is declared for them
+                // because the shader prefix declares all four, and a texture
+                // a shader declares has to be bound.
+                var textures: [4]?Texture = undefined;
+                const samplers: [4]?Sampler = .{
+                    state.sampler,
+                    state.sampler,
+                    state.sampler,
+                    state.sampler,
+                };
+
+                // The buffer passes run first and draw nothing to the
+                // screen. Each renders into its target's front texture while
+                // reading the back one, so a pass that pushes a field
+                // through itself is well defined.
+                //
+                // `state.back_texture` is the terminal image at this point:
+                // the grid was drawn into it above, and the visible chain
+                // below has not swapped yet.
+                for (
+                    self.shaders.buffer_pipelines,
+                    self.custom_passes,
+                ) |pipeline, info| {
+                    const buf = &self.custom_buffers[info.target];
+                    for (0..info.repeat) |_| {
+                        defer buf.swap();
+
+                        self.bindCustomChannels(&textures, state.back_texture);
+
+                        var pass = frame_ctx.renderPass(&.{.{
+                            .target = .{ .texture = buf.front },
+                            .clear_color = .{ 0.0, 0.0, 0.0, 0.0 },
+                        }});
+                        defer pass.complete();
+
+                        pass.step(.{
+                            .pipeline = pipeline,
+                            .uniforms = state.uniforms.buffer,
+                            .textures = &textures,
+                            .samplers = &samplers,
+                            .draw = .{
+                                .type = .triangle,
+                                .vertex_count = 3,
+                            },
+                        });
+                    }
+                }
+
                 for (self.shaders.post_pipelines, 0..) |pipeline, i| {
                     defer state.swap();
+
+                    self.bindCustomChannels(&textures, state.back_texture);
 
                     var pass = frame_ctx.renderPass(&.{.{
                         .target = if (i < self.shaders.post_pipelines.len - 1)
@@ -2308,8 +2659,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     pass.step(.{
                         .pipeline = pipeline,
                         .uniforms = state.uniforms.buffer,
-                        .textures = &.{state.back_texture},
-                        .samplers = &.{state.sampler},
+                        .textures = &textures,
+                        .samplers = &samplers,
                         .draw = .{
                             .type = .triangle,
                             .vertex_count = 3,
@@ -2493,7 +2844,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     config.bg_image != null;
 
             const old_blending = self.config.blending;
-            const custom_shaders_changed = !self.config.custom_shaders.equal(config.custom_shaders);
+            const custom_shaders_changed =
+                !self.config.custom_shaders.equal(config.custom_shaders) or
+                !self.config.custom_shader_buffers.equal(config.custom_shader_buffers) or
+                !self.config.custom_shader_passes.equal(config.custom_shader_passes);
 
             self.config.deinit();
             self.config = config.*;

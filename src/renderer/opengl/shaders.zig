@@ -85,6 +85,13 @@ pub const Shaders = struct {
     /// against the output of the previous shader.
     post_pipelines: []const Pipeline,
 
+    /// Custom shaders which run into a persistent offscreen buffer ahead of
+    /// the visible chain, rather than against the drawable.
+    ///
+    /// The renderer holds the metadata saying which buffer each of these
+    /// draws into; here they are just pipelines in order.
+    buffer_pipelines: []const Pipeline,
+
     /// Set to true when deinited, if you try to deinit a defunct set
     /// of shaders it will just be ignored, to prevent double-free.
     defunct: bool = false,
@@ -92,6 +99,7 @@ pub const Shaders = struct {
     pub const uninit: Shaders = .{
         .pipelines = undefined,
         .post_pipelines = &.{},
+        .buffer_pipelines = &.{},
         .defunct = true,
     };
 
@@ -103,6 +111,7 @@ pub const Shaders = struct {
     pub fn init(
         alloc: Allocator,
         post_shaders: []const [:0]const u8,
+        buffer_shaders: []const [:0]const u8,
     ) !Shaders {
         var pipelines: PipelineCollection = undefined;
 
@@ -134,9 +143,25 @@ pub const Shaders = struct {
             alloc.free(post_pipelines);
         };
 
+        // Buffer passes are all or nothing: a simulation missing one of its
+        // steps is not a degraded simulation, so if any of these fail we
+        // run none of them and let the visible chain read empty buffers.
+        const buffer_pipelines: []const Pipeline = initPostPipelines(
+            alloc,
+            buffer_shaders,
+        ) catch |err| err: {
+            log.warn("error initializing buffer shaders err={}", .{err});
+            break :err &.{};
+        };
+        errdefer if (buffer_pipelines.len > 0) {
+            for (buffer_pipelines) |pipeline| pipeline.deinit();
+            alloc.free(buffer_pipelines);
+        };
+
         return .{
             .pipelines = pipelines,
             .post_pipelines = post_pipelines,
+            .buffer_pipelines = buffer_pipelines,
         };
     }
 
@@ -155,6 +180,14 @@ pub const Shaders = struct {
                 pipeline.deinit();
             }
             alloc.free(self.post_pipelines);
+        }
+
+        // Release our buffer pass shaders
+        if (self.buffer_pipelines.len > 0) {
+            for (self.buffer_pipelines) |pipeline| {
+                pipeline.deinit();
+            }
+            alloc.free(self.buffer_pipelines);
         }
     }
 };
