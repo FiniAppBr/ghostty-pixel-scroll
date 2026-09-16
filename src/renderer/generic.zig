@@ -521,9 +521,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 api: GraphicsAPI,
                 width: usize,
                 height: usize,
+                chained: bool,
             ) !void {
                 if (self.custom_shader_state) |*state| {
-                    try state.resize(api, width, height);
+                    try state.resize(api, width, height, chained);
                 }
                 const target = try api.initTarget(width, height);
                 self.target.deinit();
@@ -601,16 +602,24 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 self.uniforms.deinit();
             }
 
+            /// `chained` is whether more than one shader runs in the
+            /// visible chain. Only a chain hands an image from one shader to
+            /// the next, and only that handover needs a front texture: with a
+            /// single shader the loop draws straight to the frame target and
+            /// never touches it. Leaving it at 1x1 in that case saves a
+            /// full-resolution texture per frame in flight, which at a swap
+            /// chain depth of three is three of them.
             pub fn resize(
                 self: *CustomShaderState,
                 api: GraphicsAPI,
                 width: usize,
                 height: usize,
+                chained: bool,
             ) !void {
                 const front_texture = try Texture.init(
                     api.textureOptions(),
-                    @intCast(width),
-                    @intCast(height),
+                    @intCast(if (chained) width else 1),
+                    @intCast(if (chained) height else 1),
                     null,
                 );
                 errdefer front_texture.deinit();
@@ -2410,6 +2419,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         self.api,
                         surface_size.width,
                         surface_size.height,
+                        self.shaders.post_pipelines.len > 1,
                     );
                 }
             } else if (frame.custom_shader_state) |*state| {
@@ -2427,17 +2437,30 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 self.updateScreenSizeUniforms();
             }
 
+            // Whether the visible chain hands an image from one shader to
+            // the next. This can change under a config reload, and the front
+            // texture is sized from it, so it is part of what makes a frame
+            // stale below.
+            const chained = self.shaders.post_pipelines.len > 1;
+            const front_stale = if (frame.custom_shader_state) |*state|
+                state.front_texture.width !=
+                    if (chained) self.size.screen.width else 1
+            else
+                false;
+
             // If this frame's target isn't the correct size, or the target
             // config has changed (such as when the blending mode changes),
             // remove it and replace it with a new one with the right values.
             if (frame.target.width != self.size.screen.width or
                 frame.target.height != self.size.screen.height or
-                frame.target_config_modified != self.target_config_modified)
+                frame.target_config_modified != self.target_config_modified or
+                front_stale)
             {
                 try frame.resize(
                     self.api,
                     self.size.screen.width,
                     self.size.screen.height,
+                    chained,
                 );
                 frame.target_config_modified = self.target_config_modified;
             }
