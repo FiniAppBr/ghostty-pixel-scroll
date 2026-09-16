@@ -299,10 +299,16 @@ class BaseTerminalController: NSWindowController,
         // Do the split
         let newTree: SplitTree<Ghostty.SurfaceView>
         do {
-            newTree = try surfaceTree.inserting(
+            let inserted = try surfaceTree.inserting(
                 view: newView,
                 at: oldView,
                 direction: direction)
+
+            // Under split-equalize-on-new, rebalance the whole tree rather
+            // than leaving the new split as a half of whichever pane was
+            // focused. Three panes then land on thirds instead of a half and
+            // two quarters.
+            newTree = derivedConfig.splitEqualizeOnNew ? inserted.equalized() : inserted
         } catch {
             // If splitting fails for any reason (it should not), then we just log
             // and return. The new view we created will be deinitialized and its
@@ -1484,6 +1490,7 @@ class BaseTerminalController: NSWindowController,
         let windowStepResize: Bool
         let focusFollowsMouse: Bool
         let focusFollowsScroll: Bool
+        let splitEqualizeOnNew: Bool
         let splitPreserveZoom: Ghostty.Config.SplitPreserveZoom
 
         init() {
@@ -1491,6 +1498,7 @@ class BaseTerminalController: NSWindowController,
             self.windowStepResize = false
             self.focusFollowsMouse = false
             self.focusFollowsScroll = false
+            self.splitEqualizeOnNew = false
             self.splitPreserveZoom = .init()
         }
 
@@ -1499,6 +1507,7 @@ class BaseTerminalController: NSWindowController,
             self.windowStepResize = config.windowStepResize
             self.focusFollowsMouse = config.focusFollowsMouse
             self.focusFollowsScroll = config.focusFollowsScroll
+            self.splitEqualizeOnNew = config.splitEqualizeOnNew
             self.splitPreserveZoom = config.splitPreserveZoom
         }
     }

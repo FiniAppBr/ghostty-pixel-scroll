@@ -1193,6 +1193,20 @@ palette: Palette = .{},
 /// Available since: 1.3.0
 @"split-preserve-zoom": SplitPreserveZoom = .{},
 
+/// Rebalance every split in the window whenever a new one is created, so they
+/// all end up the same size.
+///
+/// Splits are a binary tree, and a new split halves whichever pane was
+/// focused. Splitting three ways left to right therefore gives a half and two
+/// quarters, not thirds. With this set, each new split equalizes the tree the
+/// same way the `equalize_splits` action does, and three panes land on thirds.
+///
+/// This only fires when a split is created. Dragging a divider afterwards is
+/// left alone.
+///
+/// Default is false.
+@"split-equalize-on-new": bool = false,
+
 /// The foreground and background color for search matches. This only applies
 /// to non-focused search matches, also known as candidate matches.
 ///

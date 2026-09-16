@@ -51,6 +51,16 @@ struct ConfigTests {
         #expect(config.focusFollowsScroll == true)
     }
 
+    @Test func splitEqualizeOnNewDefaultsToFalse() throws {
+        let config = try TemporaryConfig("")
+        #expect(config.splitEqualizeOnNew == false)
+    }
+
+    @Test func splitEqualizeOnNewSetToTrue() throws {
+        let config = try TemporaryConfig("split-equalize-on-new = true")
+        #expect(config.splitEqualizeOnNew == true)
+    }
+
     @Test func focusFollowsScrollIsIndependentOfFocusFollowsMouse() throws {
         let config = try TemporaryConfig("focus-follows-scroll = true")
         #expect(config.focusFollowsMouse == false)
