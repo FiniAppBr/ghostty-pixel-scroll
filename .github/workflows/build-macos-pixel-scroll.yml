@@ -34,7 +34,7 @@ jobs:
       # only when build.zig.zon does. Restore-keys let a run start from the
       # previous build's cache and recompile just what changed.
       - name: Cache Zig
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cache/zig
@@ -47,7 +47,7 @@ jobs:
       # Sparkle is resolved over SwiftPM every run, and Xcode 26 can reuse
       # compiled Swift across runs given a CAS directory.
       - name: Cache Xcode
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/Library/Caches/org.swift.swiftpm
