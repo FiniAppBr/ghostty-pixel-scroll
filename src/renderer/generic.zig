@@ -908,6 +908,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             scroll_animation_bounciness: f32,
             cursor_animation_bounciness: f32,
             custom_shader_animation: configpkg.CustomShaderAnimation,
+            animation_fps: u8,
 
             pub fn init(
                 alloc_gpa: Allocator,
@@ -989,6 +990,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .background_blur = config.@"background-blur",
                     .scroll_to_bottom_on_output = config.@"scroll-to-bottom".output,
                     .custom_shader_animation = config.@"custom-shader-animation",
+                    .animation_fps = config.@"animation-fps",
                     .pixel_scroll = config.@"pixel-scroll",
                     .scroll_animation_duration = config.@"scroll-animation-duration",
                     .cursor_animation_duration = config.@"cursor-animation-duration",
@@ -1529,9 +1531,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self.syncDisplayLink(id, draw_now);
         }
 
-        /// The cadence of continuous (draw-only) animation wakes,
-        /// i.e. 120fps, and the floor for any animation wake delay.
-        pub const draw_interval_ms: u64 = 8;
+        /// The cadence of continuous (draw-only) animation wakes, and the
+        /// floor for any animation wake delay. Derived from `animation-fps`,
+        /// so 120fps is 8ms and 60fps is 16ms.
+        fn drawIntervalMs(self: *const Self) u64 {
+            const fps: u64 = @max(1, @min(240, self.config.animation_fps));
+            return @max(1, 1000 / fps);
+        }
 
         /// A point in the future when the renderer needs to be driven
         /// again to keep animating, and what kind of drive it needs.
@@ -1552,7 +1558,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
         /// The soonest animation wake this renderer needs, if any:
         /// custom shader animation wants continuous draw-only wakes
-        /// at draw_interval_ms while active, and a running Kitty
+        /// at the draw interval while active, and a running Kitty
         /// graphics animation wants an update wake when its next
         /// frame is due. The renderer thread drives its animation
         /// timer off this, re-querying after every wake.
@@ -1563,6 +1569,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         const unfocused_animation_divisor: u64 = 4;
 
         pub fn animationWake(self: *const Self) ?AnimationWake {
+            const draw_interval_ms = self.drawIntervalMs();
             // Custom shaders animate by redrawing on a fixed cadence,
             // gated by configuration and focus.
             //

@@ -3360,6 +3360,23 @@ keybind: Keybinds = .{},
 /// This can be changed at runtime and will affect all open terminals.
 @"custom-shader-animation": CustomShaderAnimation = .true,
 
+/// The frame rate animations run at, in frames per second.
+///
+/// This is the cadence of continuous animation wakes: custom shaders, the
+/// smooth scroll and cursor springs, and text fading. It is a ceiling, not a
+/// guarantee -- nothing is redrawn when nothing is animating, and a display
+/// refreshing slower than this paces the result anyway.
+///
+/// The default of 120 matches a ProMotion display. Halving it to 60 halves
+/// the GPU work every animation does, which is the single biggest lever on
+/// the cost of an expensive custom shader; on a laptop on battery it is
+/// usually worth more than anything the shader itself can be made to do.
+///
+/// Clamped to 1-240.
+///
+/// This can be changed at runtime and will affect all open terminals.
+@"animation-fps": u8 = 120,
+
 /// Bell features to enable if bell support is available in your runtime. Not
 /// all features are available on all runtimes. The format of this is a list of
 /// features to enable separated by commas. If you prefix a feature with `no-`
