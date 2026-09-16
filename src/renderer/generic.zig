@@ -170,6 +170,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// cells goes into a separate shader.
         cells: cellpkg.Contents,
 
+        /// Bumped by every `rebuildCells`. A frame compares this against
+        /// what it last drew to tell whether the grid image it is holding is
+        /// still the current one -- `cells_rebuilt` cannot answer that,
+        /// because it is consumed by whichever frame draws next while the
+        /// other frames in flight are still holding stale images.
+        cells_serial: u64 = 0,
+
         /// Set to true after rebuildCells is called. This can be used
         /// to determine if any possible changes have been made to the
         /// cells for the draw call.
@@ -435,6 +442,18 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             /// Custom shader state, this is null if we have no custom shaders.
             custom_shader_state: ?CustomShaderState = null,
 
+            /// What `gridFingerprint` returned when this frame last drew the
+            /// grid, and whether it drew one at all. If the fingerprint still
+            /// matches, `custom_shader_state.grid_texture` already holds the
+            /// right image and the grid pass can be skipped.
+            grid_fingerprint: u64 = 0,
+            grid_valid: bool = false,
+
+            /// Instance count for the text draw, kept from the last grid
+            /// build because a frame that skips the grid also skips the cell
+            /// upload that would recompute it.
+            fg_count: usize = 0,
+
             const UniformBuffer = Buffer(shaderpkg.Uniforms);
             const CellBgBuffer = Buffer(shaderpkg.CellBg);
             const CellTextBuffer = Buffer(shaderpkg.CellText);
@@ -534,9 +553,21 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
         /// State relevant to our custom shaders if we have any.
         const CustomShaderState = struct {
-            /// When we have a custom shader state, we maintain a front
-            /// and back texture which we use as a swap chain to render
-            /// between when multiple custom shaders are defined.
+            /// The grid image: the terminal exactly as it would look with
+            /// no custom shaders at all. The grid pass draws into this and
+            /// every custom shader reads it as iChannel0.
+            ///
+            /// It is retained across frames and only redrawn when the image
+            /// would actually differ, so an animation-only frame -- a frame
+            /// that exists solely to advance a shader -- skips the grid pass
+            /// and the cell uploads that feed it entirely. See `grid_dirty`
+            /// in `drawFrameLocked`.
+            grid_texture: Texture,
+
+            /// Scratch for handing an image from one visible shader to the
+            /// next. Only a chain of more than one shader needs them, so
+            /// with a single shader they stay 1x1: it reads the grid and
+            /// draws straight to the frame target, touching neither.
             front_texture: Texture,
             back_texture: Texture,
 
@@ -557,7 +588,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             const UniformBuffer = Buffer(shadertoy.Uniforms);
 
-            /// Swap the front and back textures.
+            /// Swap the front and back textures, so that what the pass
+            /// just wrote is what the next one reads.
             pub fn swap(self: *CustomShaderState) void {
                 std.mem.swap(Texture, &self.front_texture, &self.back_texture);
             }
@@ -567,8 +599,15 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 var uniforms = try UniformBuffer.init(api.uniformBufferOptions(), 1);
                 errdefer uniforms.deinit();
 
-                // Initialize the front and back textures at 1x1 px, this
-                // is slightly wasteful but it's only done once so whatever.
+                // Initialize the textures at 1x1 px, this is slightly
+                // wasteful but it's only done once so whatever.
+                const grid_texture = try Texture.init(
+                    api.textureOptions(),
+                    1,
+                    1,
+                    null,
+                );
+                errdefer grid_texture.deinit();
                 const front_texture = try Texture.init(
                     api.textureOptions(),
                     1,
@@ -588,6 +627,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 errdefer sampler.deinit();
 
                 return .{
+                    .grid_texture = grid_texture,
                     .front_texture = front_texture,
                     .back_texture = back_texture,
                     .sampler = sampler,
@@ -596,6 +636,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             }
 
             pub fn deinit(self: *CustomShaderState) void {
+                self.grid_texture.deinit();
                 self.front_texture.deinit();
                 self.back_texture.deinit();
                 self.sampler.deinit();
@@ -604,11 +645,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             /// `chained` is whether more than one shader runs in the
             /// visible chain. Only a chain hands an image from one shader to
-            /// the next, and only that handover needs a front texture: with a
-            /// single shader the loop draws straight to the frame target and
-            /// never touches it. Leaving it at 1x1 in that case saves a
-            /// full-resolution texture per frame in flight, which at a swap
-            /// chain depth of three is three of them.
+            /// the next, and only that handover needs the scratch pair: with
+            /// a single shader the loop reads the grid and draws straight to
+            /// the frame target, never touching them. Leaving them at 1x1 in
+            /// that case saves two full-resolution textures per frame in
+            /// flight, which at a swap chain depth of three is six of them.
             pub fn resize(
                 self: *CustomShaderState,
                 api: GraphicsAPI,
@@ -616,24 +657,36 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 height: usize,
                 chained: bool,
             ) !void {
-                const front_texture = try Texture.init(
-                    api.textureOptions(),
-                    @intCast(if (chained) width else 1),
-                    @intCast(if (chained) height else 1),
-                    null,
-                );
-                errdefer front_texture.deinit();
-                const back_texture = try Texture.init(
+                const scratch_w: u32 = @intCast(if (chained) width else 1);
+                const scratch_h: u32 = @intCast(if (chained) height else 1);
+
+                const grid_texture = try Texture.init(
                     api.textureOptions(),
                     @intCast(width),
                     @intCast(height),
                     null,
                 );
+                errdefer grid_texture.deinit();
+                const front_texture = try Texture.init(
+                    api.textureOptions(),
+                    scratch_w,
+                    scratch_h,
+                    null,
+                );
+                errdefer front_texture.deinit();
+                const back_texture = try Texture.init(
+                    api.textureOptions(),
+                    scratch_w,
+                    scratch_h,
+                    null,
+                );
                 errdefer back_texture.deinit();
 
+                self.grid_texture.deinit();
                 self.front_texture.deinit();
                 self.back_texture.deinit();
 
+                self.grid_texture = grid_texture;
                 self.front_texture = front_texture;
                 self.back_texture = back_texture;
             }
@@ -2463,6 +2516,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     chained,
                 );
                 frame.target_config_modified = self.target_config_modified;
+
+                // The grid texture is one of the ones just thrown away, so
+                // whatever image this frame was holding is gone with it.
+                frame.grid_valid = false;
             }
 
             // Size our persistent shader buffers to the screen. These belong
@@ -2503,8 +2560,59 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self.uniforms.projection_matrix = self.projectionMatrix(grid_offset);
 
             try frame.uniforms.sync(&.{self.uniforms});
-            try frame.cells_bg.sync(self.cells.bg_cells);
-            const fg_count = try frame.cells.syncFromArrayLists(self.cells.fg_rows);
+
+            // Does the grid pass have to run, or is the image this frame is
+            // already holding still the right one?
+            //
+            // Under `custom-shader-animation = always` every frame is a draw,
+            // because a shader has to advance. The grid usually has no reason
+            // to: nothing is being typed, nothing is scrolling, the cursor is
+            // sitting still. Redrawing it anyway means re-uploading every cell
+            // and re-running the whole grid pass at the display's refresh rate
+            // to produce the identical image, purely so the shader chain has
+            // an iChannel0 to read. Instead the image is kept in
+            // `grid_texture` and reused until something actually changes it.
+            //
+            // The fingerprint covers everything the grid pass reads: the
+            // uniforms (which carry the projection, so a smooth scroll and a
+            // moving cursor both land here), the cell data, and the atlases.
+            // Images and overlays are not fingerprinted -- they are drawn
+            // from state that is awkward to summarise cheaply -- so a surface
+            // showing any of them opts out of reuse entirely and redraws as
+            // it always did.
+            const grid_reusable =
+                frame.custom_shader_state != null and
+                self.bg_image == null and
+                self.images.kitty_placements.items.len == 0 and
+                self.images.overlay_placements.items.len == 0;
+
+            const grid_fingerprint: u64 = fp: {
+                var h: std.hash.Wyhash = .init(self.cells_serial);
+                h.update(std.mem.asBytes(&self.uniforms));
+                h.update(std.mem.asBytes(&self.bg_image_buffer_modified));
+                const gray = self.font_grid.atlas_grayscale.modified.load(.monotonic);
+                const color = self.font_grid.atlas_color.modified.load(.monotonic);
+                h.update(std.mem.asBytes(&gray));
+                h.update(std.mem.asBytes(&color));
+                break :fp h.final();
+            };
+
+            const grid_dirty =
+                !grid_reusable or
+                !frame.grid_valid or
+                frame.grid_fingerprint != grid_fingerprint or
+                sync;
+
+            // The cell buffers are built from the same state the fingerprint
+            // covers, so a frame that reuses the grid has nothing to upload.
+            // This is the larger half of the saving: the buffers are one
+            // entry per cell and one per glyph, and they were being handed to
+            // the GPU every single frame.
+            if (grid_dirty) {
+                try frame.cells_bg.sync(self.cells.bg_cells);
+                frame.fg_count = try frame.cells.syncFromArrayLists(self.cells.fg_rows);
+            }
+            const fg_count = frame.fg_count;
 
             // If our background image buffer has changed, sync it.
             if (frame.bg_image_buffer_modified != self.bg_image_buffer_modified) {
@@ -2535,10 +2643,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             var frame_ctx = try self.api.beginFrame(self, &frame.target);
             defer frame_ctx.complete(sync);
 
-            {
+            if (grid_dirty) {
+                frame.grid_fingerprint = grid_fingerprint;
+                frame.grid_valid = grid_reusable;
+
                 var pass = frame_ctx.renderPass(&.{.{
                     .target = if (frame.custom_shader_state) |state|
-                        .{ .texture = state.back_texture }
+                        .{ .texture = state.grid_texture }
                     else
                         .{ .target = frame.target },
                     .clear_color = .{ 0.0, 0.0, 0.0, 0.0 },
@@ -2658,9 +2769,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // reading the back one, so a pass that pushes a field
                 // through itself is well defined.
                 //
-                // `state.back_texture` is the terminal image at this point:
-                // the grid was drawn into it above, and the visible chain
-                // below has not swapped yet.
+                // `state.grid_texture` is the terminal image, drawn above or
+                // carried over from the last frame that needed to draw one.
                 for (
                     self.shaders.buffer_pipelines,
                     self.custom_passes,
@@ -2669,7 +2779,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     for (0..@as(usize, info.repeat)) |_| {
                         defer buf.swap();
 
-                        self.bindCustomChannels(&textures, state.back_texture);
+                        self.bindCustomChannels(&textures, state.grid_texture);
 
                         var pass = frame_ctx.renderPass(&.{.{
                             .target = .{ .texture = buf.front },
@@ -2691,12 +2801,23 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 }
 
                 for (self.shaders.post_pipelines, 0..) |pipeline, i| {
-                    defer state.swap();
+                    const last = i == self.shaders.post_pipelines.len - 1;
 
-                    self.bindCustomChannels(&textures, state.back_texture);
+                    // The swap hands this pass's output to the next one. The
+                    // last pass has no next one, and swapping after it would
+                    // put a scratch texture where the grid image belongs --
+                    // which, with a single shader, is a 1x1 stub.
+                    defer if (!last) state.swap();
+
+                    // The first shader reads the grid; the rest read whatever
+                    // the shader before them left in the scratch pair.
+                    self.bindCustomChannels(
+                        &textures,
+                        if (i == 0) state.grid_texture else state.back_texture,
+                    );
 
                     var pass = frame_ctx.renderPass(&.{.{
-                        .target = if (i < self.shaders.post_pipelines.len - 1)
+                        .target = if (!last)
                             .{ .texture = state.front_texture }
                         else
                             .{ .target = frame.target },
@@ -3979,6 +4100,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             // Update that our cells rebuilt
             self.cells_rebuilt = true;
+            self.cells_serial +%= 1;
 
             // Log some things
             // log.debug("rebuildCells complete cached_runs={}", .{

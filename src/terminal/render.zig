@@ -52,7 +52,7 @@ const Terminal = @import("Terminal.zig");
 ///     {
 ///         mutex.lock();
 ///         defer mutex.unlock();
-///         try state.beginUpdate(alloc, &terminal);
+///         try state.beginUpdate(alloc, &terminal, .{});
 ///     }
 ///
 ///     // The IO thread is free to modify the terminal while we
@@ -1752,7 +1752,7 @@ test "begin and end update" {
 
     var state: RenderState = .empty;
     defer state.deinit(alloc);
-    try state.beginUpdate(alloc, &t);
+    try state.beginUpdate(alloc, &t, .{});
 
     // We should have pending style runs on row 0: one for the bold
     // run and one for the italic run.
