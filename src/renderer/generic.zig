@@ -458,6 +458,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             grid_fingerprint: u64 = 0,
             grid_valid: bool = false,
 
+            /// The `cells_serial` the cell buffers were last uploaded from.
+            /// The grid fingerprint above also covers the uniforms, which
+            /// carry the projection: a smooth scroll changes the projection
+            /// every frame while the cells stay put, so the image has to be
+            /// redrawn but the buffers have nothing new to hold. Null until
+            /// the first upload, since a serial of 0 is a real value.
+            cells_serial: ?u64 = null,
+
             /// Instance count for the text draw, kept from the last grid
             /// build because a frame that skips the grid also skips the cell
             /// upload that would recompute it.
@@ -960,6 +968,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             custom_shaders: configpkg.RepeatablePath,
             custom_shader_buffers: configpkg.Config.RepeatableShaderBuffer,
             custom_shader_passes: configpkg.Config.RepeatableShaderPass,
+            custom_shader_pass_stride: u8,
             bg_image: ?configpkg.Path,
             bg_image_opacity: f32,
             bg_image_position: configpkg.BackgroundImagePosition,
@@ -1061,6 +1070,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .background_blur = config.@"background-blur",
                     .scroll_to_bottom_on_output = config.@"scroll-to-bottom".output,
                     .custom_shader_animation = config.@"custom-shader-animation",
+                    .custom_shader_pass_stride = config.@"custom-shader-pass-stride",
                     .animation_fps = config.@"animation-fps",
                     .pixel_scroll = config.@"pixel-scroll",
                     .scroll_animation_duration = config.@"scroll-animation-duration",
@@ -2633,14 +2643,22 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 frame.grid_fingerprint != grid_fingerprint or
                 sync;
 
-            // The cell buffers are built from the same state the fingerprint
-            // covers, so a frame that reuses the grid has nothing to upload.
-            // This is the larger half of the saving: the buffers are one
-            // entry per cell and one per glyph, and they were being handed to
-            // the GPU every single frame.
-            if (grid_dirty) {
+            // The cell buffers change only when the cells are rebuilt, which
+            // `cells_serial` counts. A frame whose buffers already hold this
+            // build has nothing to upload even when the grid has to be drawn
+            // again -- under a smooth scroll or a moving cursor the
+            // projection changes every frame and the cells do not, and this
+            // is what keeps a scroll from re-sending every cell and glyph to
+            // the GPU at the display's refresh rate. Frames that opt out of
+            // grid reuse (images, overlays) upload as they always did.
+            const cells_dirty =
+                !grid_reusable or
+                frame.cells_serial != self.cells_serial or
+                sync;
+            if (cells_dirty) {
                 try frame.cells_bg.sync(self.cells.bg_cells);
                 frame.fg_count = try frame.cells.syncFromArrayLists(self.cells.fg_rows);
+                frame.cells_serial = self.cells_serial;
             }
             const fg_count = frame.fg_count;
 
@@ -2801,7 +2819,15 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 //
                 // `state.grid_texture` is the terminal image, drawn above or
                 // carried over from the last frame that needed to draw one.
-                for (
+                //
+                // `custom-shader-pass-stride` skips the whole chain on the
+                // frames between steps. Nothing swaps, so every buffer keeps
+                // what it holds, which is exactly what a pass that copies
+                // itself through would have produced.
+                const stride: i32 = @max(1, @as(i32, self.config.custom_shader_pass_stride));
+                const run_passes = stride == 1 or
+                    @rem(self.custom_shader_uniforms.frame, stride) == 0;
+                if (run_passes) for (
                     self.shaders.buffer_pipelines,
                     self.custom_passes,
                 ) |pipeline, info| {
@@ -2828,7 +2854,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                             },
                         });
                     }
-                }
+                };
 
                 for (self.shaders.post_pipelines, 0..) |pipeline, i| {
                     const last = i == self.shaders.post_pipelines.len - 1;

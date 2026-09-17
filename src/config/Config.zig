@@ -3340,6 +3340,24 @@ keybind: Keybinds = .{},
 /// This can be changed at runtime and will affect all open terminals.
 @"custom-shader-pass": RepeatableShaderPass = .{},
 
+/// Run the `custom-shader-pass` chain only on every Nth animated frame.
+///
+/// A simulation stepped at 60Hz looks the same as one stepped at 120Hz --
+/// what you see moves at the speed of the field, not of the clock -- so a
+/// chain that gates itself on `iFrame` parity and copies its buffer through
+/// on the other frames is doing a dozen render passes a frame to change
+/// nothing. With a stride of 2 those frames skip the chain entirely: the
+/// buffers keep what they hold (a skipped pass is exactly a copy), the
+/// visible shaders still run every frame, and the pass encode and the
+/// pass-boundary cost on a tile-based GPU are halved.
+///
+/// The passes run on frames where `iFrame` is a multiple of the stride, so a
+/// shader that steps on even frames sees the same frames it always did.
+/// 1 (the default) runs the chain every frame. 0 is treated as 1.
+///
+/// This can be changed at runtime and will affect all open terminals.
+@"custom-shader-pass-stride": u8 = 1,
+
 /// If `true` (default), the focused terminal surface will run an animation
 /// loop when custom shaders are used. This uses slightly more CPU (generally
 /// less than 10%) but allows the shader to animate. This only runs if there
