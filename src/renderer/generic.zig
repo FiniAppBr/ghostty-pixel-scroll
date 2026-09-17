@@ -132,8 +132,17 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// The size of everything.
         size: renderer.Size,
 
-        /// True if the window is focused
+        /// True if this surface is focused. Note this is the SURFACE, not
+        /// the window: a window of splits has exactly one focused surface
+        /// and the rest are unfocused while the window itself is key.
         focused: bool,
+
+        /// True if the application has focus, which is a different question
+        /// from the one above whenever a window holds splits. Animation is
+        /// gated on this rather than on `focused`, so that a window of splits
+        /// keeps all of them moving while the user is looking at it and stops
+        /// all of them when they are not.
+        app_focused: bool,
 
         /// True if the window is visible.
         visible: bool,
@@ -1105,6 +1114,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 .grid_metrics = font_critical.metrics,
                 .size = options.size,
                 .focused = true,
+                .app_focused = true,
                 .visible = true,
                 .scrollbar = .zero,
                 .scrollbar_dirty = false,
@@ -1642,6 +1652,15 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // cost of one.
             const shader_delay: ?u64 = shader: {
                 if (!self.has_custom_shaders) break :shader null;
+
+                // Nothing animates while the application is in the
+                // background, whatever the mode says. `always` is about
+                // keeping the splits of a window alive next to each other,
+                // not about burning the GPU behind another app -- and the
+                // surface-level check below cannot express that, since every
+                // surface of an unfocused window is unfocused and so is every
+                // surface but one of a focused window.
+                if (!self.app_focused) break :shader null;
                 break :shader switch (self.config.custom_shader_animation) {
                     .false => null,
                     .always => if (self.focused)
@@ -1730,6 +1749,17 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self.custom_shader_focused_changed = true;
 
             self.syncDisplayLink(null, null);
+        }
+
+        /// Callback when the application gains or loses focus, as opposed to
+        /// this one surface. Only animation reads it, so unlike setFocus
+        /// there is no shader uniform to dirty: iFocus stays the per-surface
+        /// answer, which is what a shader wanting to know "am I the split
+        /// being typed into" needs.
+        ///
+        /// Must be called on the render thread.
+        pub fn setAppFocus(self: *Self, focus: bool) void {
+            self.app_focused = focus;
         }
 
         /// Callback when the window is visible or occluded.

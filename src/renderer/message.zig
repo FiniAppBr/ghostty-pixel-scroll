@@ -17,6 +17,16 @@ pub const Message = union(enum) {
     /// the renderer is expected to handle all of these.
     focus: bool,
 
+    /// A change in whether the application as a whole has focus, as opposed
+    /// to `focus` above, which is this one surface. The two are different
+    /// whenever a window holds splits: clicking from one split to another
+    /// moves surface focus without the application ever losing it.
+    ///
+    /// Sent to every surface, because the thing it answers -- "is the user
+    /// looking at Ghostty at all" -- is not something any single surface can
+    /// work out from its own focus state.
+    app_focus: bool,
+
     /// A change in the view occlusion state. This can be used to determine
     /// if the window is visible or not. A window can be not visible (occluded)
     /// and still have focus.

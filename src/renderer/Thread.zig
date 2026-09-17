@@ -331,6 +331,14 @@ fn drainMailbox(self: *Thread) !void {
                 // check the visible state themselves to control their behavior.
             },
 
+            .app_focus => |v| {
+                // Animation is gated on this, so re-arm the timer: the
+                // surfaces that were stopped have to be started again, and
+                // the ones that were running have to be stopped.
+                self.renderer.setAppFocus(v);
+                self.armAnimationTimer();
+            },
+
             .focus => |v| focus: {
                 // If our state didn't change we do nothing.
                 if (self.flags.focused == v) break :focus;

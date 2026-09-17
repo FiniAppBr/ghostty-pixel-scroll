@@ -332,6 +332,21 @@ pub fn focusEvent(self: *App, focused: bool) void {
 
     log.debug("focus event focused={}", .{focused});
     self.focused = focused;
+
+    // Tell every surface, not just the focused one. Custom shader animation
+    // is gated on this, and the question it answers -- is the user looking at
+    // Ghostty at all -- is one no single surface can answer for itself: every
+    // surface of a background window is unfocused, and so is every surface
+    // but one of a foreground window holding splits.
+    for (self.surfaces.items) |rt_surface| {
+        const surface = rt_surface.core();
+        _ = surface.renderer_thread.mailbox.push(global.io(), .{
+            .app_focus = focused,
+        }, .{ .forever = {} });
+        surface.renderer_thread.wakeup.notify() catch |err| {
+            log.warn("error waking renderer on app focus err={}", .{err});
+        };
+    }
 }
 
 /// Handle a key event at the app-scope. If this key event is used,
