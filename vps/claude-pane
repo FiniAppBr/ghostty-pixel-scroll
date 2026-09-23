@@ -1,0 +1,57 @@
+#!/bin/sh
+# One claude session in the project, then a shell. Exiting claude drops you to
+# bash rather than closing the terminal split you are sitting in.
+#
+# $1 is the pane slot handed over by pane-connect.sh on the laptop. Each slot
+# owns one conversation id, so a split that reconnects after a dropped link
+# picks its own conversation back up instead of starting over or stealing a
+# neighbouring split's. Forget one with: rm ~/.claude-panes/slot-N.id
+#
+# $2 is "fresh" or "resume". pane-connect.sh sends fresh on a split's first
+# connection and resume on every reconnect after that, so opening Ghostty
+# starts three empty conversations while a dropped link still gets its own
+# one back.
+export TERM=xterm-256color
+
+# Without this, Claude Code quantises every colour onto the 256-colour cube and
+# the spinner shimmer collapses from a gradient into two or three hard steps -
+# which the bloom shader on the laptop then pops on and off rather than swelling.
+# ssh cannot carry it here: sshd is AcceptEnv LANG LC_*, so a forwarded
+# COLORTERM is dropped. Setting it on this side is what gets exact RGB.
+export COLORTERM=truecolor
+
+PROJECT=/opt/violaoacademy
+cd "$PROJECT" || exit 1
+
+slot=${1:-0}
+mode=${2:-resume}
+state=$HOME/.claude-panes
+idfile=$state/slot-$slot.id
+# Wipe the screen AND the scrollback (3J) just before claude takes over, so
+# the pane opens clean. Everything above is startup chatter nobody reads: the
+# login banner, whatever the local wrapper had to say, the slot bookkeeping.
+# Doing it here rather than chasing each source means anything printed on the
+# way in is covered, including things added later.
+clear_pane() { printf '\033[H\033[2J\033[3J'; }
+
+sessions=$HOME/.claude/projects/-opt-violaoacademy
+mkdir -p "$state"
+
+# In fresh mode the stored id is simply not read, so the branch below mints
+# a new one and overwrites the file with it.
+sid=""
+[ "$mode" != fresh ] && [ -s "$idfile" ] && sid=$(cat "$idfile")
+
+# Only resume an id claude still has on disk. A pruned or never-started one
+# makes --resume fail, which would leave the pane with no claude in it at all.
+if [ -n "$sid" ] && [ -f "$sessions/$sid.jsonl" ]; then
+    clear_pane
+    claude --resume "$sid"
+else
+    sid=$(uuidgen | tr 'A-Z' 'a-z')
+    printf '%s\n' "$sid" > "$idfile"
+    clear_pane
+    claude --session-id "$sid"
+fi
+
+exec bash -l

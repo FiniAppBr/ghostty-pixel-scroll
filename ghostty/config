@@ -1,0 +1,190 @@
+# Ghostty — pixel-scroll build (1.3.2-dev + smooth scrolling and cursor motion)
+#
+# The app is ~/Applications/Ghostty.app, built from ~/dev/ghostty-rebase on
+# branch ci-pixel-scroll. Stock 1.3.1 is kept beside it as Ghostty-1.3.1.app.
+
+# --- cursor ------------------------------------------------------------------
+#
+# cursor-style is left at Ghostty's default (block).
+
+# A blinking cursor keeps vanishing mid-move, and a move that starts while it
+# is hidden has nowhere to animate from, so blink is off.
+cursor-style-blink = false
+
+# How long the cursor takes to reach a new cell. Each corner of it is sprung
+# separately, so it stretches on the way and gathers itself on arrival.
+# 0 turns the motion off and the cursor jumps.
+cursor-animation-duration = 0.08
+cursor-animation-bounciness = 0
+
+# --- scrolling ---------------------------------------------------------------
+#
+# Scrolling animates the whole distance rather than snapping. Duration is how
+# long a scroll takes to settle; bounciness above 0 lets it overshoot and come
+# back.
+pixel-scroll = true
+scroll-animation-duration = 0.18
+scroll-animation-bounciness = 0
+
+# --- housekeeping ------------------------------------------------------------
+#
+# This is a local build, so don't offer to replace it with a release.
+auto-update = off
+
+# --- what a window opens on --------------------------------------------------
+#
+# Every window and every split is its own connection to the VPS, running claude
+# in /opt/violaoacademy. Separate connections rather than tmux panes, so each
+# split has its own selection and copy/paste that doesn't drag text out of its
+# neighbours. Exiting claude drops that split to a bash login shell instead of
+# closing it.
+#
+# This was briefly mosh, for local echo instead of a ~48ms round trip per
+# keystroke. Reverted: mosh runs entirely in the alternate screen buffer
+# (it emits \e[?1049h on connect), so there is no scrollback for pixel-scroll
+# to move through, the wheel falls back to sending arrow keys, and the text
+# fade has no newly-arriving rows to animate. Smooth scrolling and mosh are
+# mutually exclusive, not a matter of configuration.
+#
+# The mosh launcher is still at pane-launch.sh next to this file if it is ever
+# wanted again; point `command` at it with `direct:/bin/sh <path>`.
+#
+# The ssh now runs inside pane-connect.sh rather than being the command
+# itself. Ghostty ends a surface when its command exits, so a dropped
+# connection used to close the split outright; the wrapper reconnects instead.
+# It also hands each split a slot number, and claude-pane keeps one
+# conversation id per slot, so a reconnect resumes the conversation that split
+# already had. Forget one on the VPS with: rm ~/.claude-panes/slot-N.id
+command = direct:/bin/sh /Users/luizpasqualefilho/.config/ghostty/pane-connect.sh
+
+# Three across, evened out, on every new window. This is a setting in this
+# build rather than something restored: macOS decides whether windows come
+# back at all, and it says no by default.
+initial-splits = 2
+
+# All three splits are worked at once, so none of them is "background".
+# Ghostty dims unfocused splits to 0.7 by default to show which one has
+# focus; 1 turns that off and leaves them all at full brightness. The
+# cursor still marks which split takes keystrokes.
+unfocused-split-opacity = 1
+
+# A trackpad scroll doesn't move the pointer, so focus-follows-mouse never
+# sees it and the split under the cursor would scroll while the keystrokes
+# still went elsewhere. This focuses whatever split is scrolled. Momentum
+# is ignored, so a flick that is still coasting can't pull focus back after
+# you've moved on. Local to this build.
+focus-follows-scroll = true
+
+# Text fades up from the background as it is written, rather than landing on
+# it. Only text that is actually new: a line growing to the right fades in
+# what it gained, a redraw of what was already there does not. 0 turns it off.
+text-fade-duration = 0.12
+
+# Bring back whatever windows and splits were open when Ghostty last quit.
+window-save-state = always
+
+# Let ssh carry Ghostty's terminfo and environment to remote hosts.
+shell-integration-features = ssh-env,ssh-terminfo
+
+# No "are you sure" when closing a window.
+confirm-close-surface = false
+
+# --- shader ------------------------------------------------------------------
+#
+# There is exactly one visible shader now: visible.glsl, listed at the end of
+# the fluid block below. It is cursor-halo.glsl, shimmer-bloom.glsl and
+# fluid/composite.glsl merged into one pass, because as three entries each one
+# re-read the full-resolution output of the one before it. All three sets of
+# tunables survived, grouped by stage at the top of that file.
+#
+# The spinner's glow is no longer blurred by a shader at all. Green pixels
+# emit into the fluid, and the solver spreads what it carries -- spreading is
+# what a blur is -- so the halo falls out of work already being done. That
+# retired shimmer-blur.glsl and the whole `bloom` buffer with it.
+#
+# Still on disk and no longer in the chain: cursor-halo.glsl, shimmer-bloom.glsl,
+# shimmer-blur.glsl and nebula.glsl. nebula was dropped outright -- five domain-warped fbm calls
+# on every screen pixel every frame made it by a wide margin the most expensive
+# thing here, and the fluid fills the space it used to.
+
+# --- fluid -------------------------------------------------------------------
+#
+# A real Navier-Stokes solve running behind the text: velocity is advected and
+# projected divergence-free every frame, glyphs are solid obstacles the flow
+# has to go around, and output landing shoves the fluid where it lands.
+#
+# This needs the custom-shader-buffer / custom-shader-pass support in the fork
+# (branch `fluid`). A build without it does not know these keys and will open
+# its config-error window on launch, so comment this whole block out before
+# running stock 1.3.1.
+#
+# The buffers are the whole state. sim is eighth-scale because a pressure
+# solve is many passes and only its shape has to be right; dye is a bit over a
+# third because it is the part you actually see, but it is smoke and carries no
+# detail that a finer grid would keep.
+custom-shader-buffer = sim:0.125
+custom-shader-buffer = dye:0.35
+
+# Not a field at all: a handful of texels holding one number, which is how
+# much smoke a write is currently worth. A fragment shader has nowhere else to
+# keep a value between frames, so a buffer is the only place it can live. The
+# scale is as small as it can be asked for; the cost is the extra pass, not
+# the pixels.
+custom-shader-buffer = beat:0.125
+
+# Runs first, so the passes after it read the count this frame rather than
+# last frame's.
+custom-shader-pass = beat:/Users/luizpasqualefilho/.config/ghostty/shaders/fluid/beat.glsl
+custom-shader-pass = beat:/Users/luizpasqualefilho/.config/ghostty/shaders/fluid/beat-rows.glsl
+
+custom-shader-pass = sim:/Users/luizpasqualefilho/.config/ghostty/shaders/fluid/sim-advect.glsl
+custom-shader-pass = sim:/Users/luizpasqualefilho/.config/ghostty/shaders/fluid/sim-project.glsl:8
+custom-shader-pass = sim:/Users/luizpasqualefilho/.config/ghostty/shaders/fluid/sim-gradient.glsl
+custom-shader-pass = dye:/Users/luizpasqualefilho/.config/ghostty/shaders/fluid/dye-advect.glsl
+
+# The one visible pass, and the only `custom-shader` entry. It goes last
+# because it does not key against the terminal image to find the text -- the
+# glyph mask comes out of the dye buffer -- so it does not care what ran
+# before it.
+custom-shader = /Users/luizpasqualefilho/.config/ghostty/shaders/visible.glsl
+
+# Every split keeps animating, not just the focused one. In the fork the
+# unfocused ones run at a reduced rate, so this costs a fraction of what
+# `always` sounds like.
+custom-shader-animation = always
+
+# Animation cadence. 120 was the hardcoded default and matches this display,
+# but every animated frame costs the whole shader chain; 60 halves that at a
+# stroke and is the single biggest lever on what this all costs.
+animation-fps = 120
+
+# Skip the buffer chain on odd frames instead of running twelve copy passes.
+# Needs the build from commit 80d7b6993 or later; an older build rejects the
+# key. Enable once that build is installed.
+custom-shader-pass-stride = 2
+
+# --- palette -----------------------------------------------------------------
+#
+# Claude Code's inline code spans ignore the theme file: the markdown renderer
+# looks "permission" up in the built-in theme rather than the overrides, so a
+# codespan always comes out the stock light blue, rgb(153,204,255). Other
+# tokens in the same theme file do apply — this one just isn't consulted.
+#
+# It arrives as a palette index rather than as RGB because sshd on the VPS is
+# AcceptEnv LANG LC_*, which drops the COLORTERM that ssh-env above tries to
+# forward. With COLORTERM unset, Claude Code quantises with round(v / 255 * 5),
+# and that lands rgb(153,204,255) exactly on index 153 — so remapping the slot
+# is what recolours inline code.
+#
+# The catch: 153 is a shared slot, not Claude Code's. Everything in the band
+# R 128-178 / G 179-229 / B 230-255 quantises onto it — 67,626 RGB values — so
+# every light blue in every program in every split turns green too, including
+# type and component names inside code blocks. Ghostty's stock 153 is #afd7ff.
+#
+# Setting COLORTERM=truecolor *on the VPS* undoes all of this: Claude Code
+# would emit exact RGB and stop consulting the palette at all.
+# Retired 2026-09-15: claude-pane on the VPS now exports COLORTERM=truecolor,
+# so Claude Code emits exact RGB and never reaches for slot 153. The line
+# below no longer recolours anything in Claude Code - it only still turns
+# every other program's light blue green. Uncomment to bring it back.
+# palette = 153=#57d4a0

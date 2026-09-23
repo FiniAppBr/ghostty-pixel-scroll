@@ -1,0 +1,67 @@
+{
+  "version": 4,
+  "lines": [
+    [
+      {
+        "id": "1",
+        "type": "context-percentage",
+        "color": "ansi256:253",
+        "rawValue": true
+      },
+      {
+        "id": "2",
+        "type": "separator",
+        "color": "ansi256:238"
+      },
+      {
+        "id": "3",
+        "type": "weekly-usage",
+        "color": "ansi256:250",
+        "rawValue": true
+      },
+      {
+        "id": "4",
+        "type": "flex-separator"
+      },
+      {
+        "id": "5",
+        "type": "model",
+        "color": "ansi256:250",
+        "rawValue": true
+      },
+      {
+        "id": "6",
+        "type": "separator",
+        "color": "ansi256:238"
+      },
+      {
+        "id": "7",
+        "type": "thinking-effort",
+        "color": "ansi256:244",
+        "rawValue": true
+      }
+    ],
+    [],
+    []
+  ],
+  "flexMode": "full",
+  "compactThreshold": 60,
+  "colorLevel": 2,
+  "inheritSeparatorColors": false,
+  "globalBold": false,
+  "gitCacheTtlSeconds": 5,
+  "minimalistMode": false,
+  "powerline": {
+    "enabled": false,
+    "separators": [
+      ""
+    ],
+    "separatorInvertBackground": [
+      false
+    ],
+    "startCaps": [],
+    "endCaps": [],
+    "autoAlign": false,
+    "continueThemeAcrossLines": false
+  }
+}
