@@ -2311,8 +2311,40 @@ extension Ghostty.SurfaceView {
         return .copy
     }
 
+    /// Local to this build: when ~/bin/ghostty-drop-upload exists, dropped files
+    /// are handed to it instead of having their local paths typed. It uploads
+    /// them to wherever the panes actually run and prints the paths to type in
+    /// their place. A failed upload types nothing.
+    static let dropUploader = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent("bin/ghostty-drop-upload")
+
     override func performDragOperation(_ sender: any NSDraggingInfo) -> Bool {
         let pb = sender.draggingPasteboard
+
+        let files = (pb.readObjects(forClasses: [NSURL.self],
+                                    options: [.urlReadingFileURLsOnly: true]) as? [URL]) ?? []
+        if !files.isEmpty,
+           FileManager.default.isExecutableFile(atPath: Self.dropUploader.path) {
+            DispatchQueue.global(qos: .userInitiated).async {
+                let p = Process()
+                p.executableURL = Self.dropUploader
+                p.arguments = files.map(\.path)
+                let out = Pipe()
+                p.standardOutput = out
+                p.standardError = FileHandle.nullDevice
+                guard (try? p.run()) != nil else { return }
+                let data = out.fileHandleForReading.readDataToEndOfFile()
+                p.waitUntilExit()
+                guard p.terminationStatus == 0,
+                      let text = String(data: data, encoding: .utf8)?
+                        .trimmingCharacters(in: .whitespacesAndNewlines),
+                      !text.isEmpty else { return }
+                DispatchQueue.main.async {
+                    self.surfaceModel?.sendText(text + " ")
+                }
+            }
+            return true
+        }
 
         let content = pb.getOpinionatedStringContents()
 
