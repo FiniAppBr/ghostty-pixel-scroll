@@ -1632,10 +1632,7 @@ fn mouseRefreshLinks(
         const link = (try self.linkAtPos(pos)) orelse break :link .{ null, false };
         switch (link.action) {
             .open => {
-                const str = try self.io.terminal.screens.active.selectionString(alloc, .{
-                    .sel = link.selection,
-                    .trim = false,
-                });
+                const str = try self.linkString(alloc, link.selection, false);
                 break :link .{
                     .{ .url = str },
                     self.config.link_previews == .true,
@@ -2263,7 +2260,11 @@ fn copySelectionToClipboards(
             try formatter.format(&aw.writer);
             contents.appendAssumeCapacity(.{
                 .mime = "text/plain",
-                .data = try aw.toOwnedSliceSentinel(0),
+                .data = terminal.url_wrap.joinSelection(
+                    self.io.terminal.screens.active,
+                    sel,
+                    try aw.toOwnedSliceSentinel(0),
+                ),
             });
         },
 
@@ -2308,7 +2309,11 @@ fn copySelectionToClipboards(
             try formatter.format(&aw.writer);
             contents.appendAssumeCapacity(.{
                 .mime = "text/plain",
-                .data = try aw.toOwnedSliceSentinel(0),
+                .data = terminal.url_wrap.joinSelection(
+                    self.io.terminal.screens.active,
+                    sel,
+                    try aw.toOwnedSliceSentinel(0),
+                ),
             });
 
             assert(aw.written().len == 0);
@@ -4382,6 +4387,23 @@ const Link = struct {
     selection: terminal.Selection,
 };
 
+/// The text of a regex link. A link that was hard-wrapped across rows
+/// comes back as one piece, without the line breaks and indents.
+fn linkString(
+    self: *Surface,
+    alloc: Allocator,
+    sel: terminal.Selection,
+    trim: bool,
+) ![:0]const u8 {
+    const raw = try self.io.terminal.screens.active.selectionString(alloc, .{
+        .sel = sel,
+        .trim = trim,
+    });
+    if (std.mem.indexOfScalar(u8, raw, '\n') == null) return raw;
+    defer alloc.free(raw);
+    return try terminal.url_wrap.joinLink(alloc, raw);
+}
+
 /// Returns the link at the given cursor position, if any.
 ///
 /// Requires the renderer mutex is held.
@@ -4431,9 +4453,31 @@ fn linkAtPin(
 ) !?Link {
     if (self.config.links.len == 0) return null;
 
+    // A URL the program hard-wrapped (Claude Code does) starts on an
+    // earlier row than the one clicked, so look for links on that row
+    // first. Its tail on this row could otherwise match on its own as a
+    // bare path.
+    const head = terminal.url_wrap.head(mouse_pin);
+    if (head.node != mouse_pin.node or head.y != mouse_pin.y) {
+        if (try self.linkOnLine(head, mouse_pin, mouse_mods)) |link| return link;
+    }
+    return try self.linkOnLine(mouse_pin, mouse_pin, mouse_mods);
+}
+
+/// Matches the configured links against the line holding `line_pin` and
+/// returns the one covering `mouse_pin`. A match running off the end of a
+/// row into a hard-wrapped continuation is extended to cover it.
+///
+/// Requires the renderer state mutex is held.
+fn linkOnLine(
+    self: *Surface,
+    line_pin: terminal.Pin,
+    mouse_pin: terminal.Pin,
+    mouse_mods: ?input.Mods,
+) !?Link {
     const screen: *terminal.Screen = self.renderer_state.terminal.screens.active;
     const line = screen.selectLine(.{
-        .pin = mouse_pin,
+        .pin = line_pin,
         .whitespace = null,
         // Respect semantic prompt boundaries so link/path matching doesn't
         // merge shell prompt content with the text beside it.
@@ -4457,7 +4501,12 @@ fn linkAtPin(
         while (true) {
             var match = (try it.next()) orelse break;
             defer match.deinit();
-            const sel = match.selection();
+            const matched = match.selection();
+            const sel = terminal.Selection.init(
+                matched.start(),
+                terminal.url_wrap.extendEnd(matched.end()),
+                false,
+            );
             if (!sel.contains(screen, mouse_pin)) continue;
             return .{
                 .action = link.action,
@@ -4496,10 +4545,7 @@ fn processLinks(self: *Surface, pos: apprt.CursorPos) !bool {
     const link = try self.linkAtPos(pos) orelse return false;
     switch (link.action) {
         .open => {
-            const str = try self.io.terminal.screens.active.selectionString(self.alloc, .{
-                .sel = link.selection,
-                .trim = false,
-            });
+            const str = try self.linkString(self.alloc, link.selection, false);
             defer self.alloc.free(str);
 
             const resolved_path = try self.resolvePathForOpening(str);
@@ -5138,10 +5184,11 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
                 const url_text = switch (link_info.action) {
                     .open => url_text: {
                         // For regex links, get the text from selection
-                        break :url_text (self.io.terminal.screens.active.selectionString(self.alloc, .{
-                            .sel = link_info.selection,
-                            .trim = self.config.clipboard_trim_trailing_spaces,
-                        })) catch |err| {
+                        break :url_text self.linkString(
+                            self.alloc,
+                            link_info.selection,
+                            self.config.clipboard_trim_trailing_spaces,
+                        ) catch |err| {
                             log.err("error reading url string err={}", .{err});
                             return false;
                         };
