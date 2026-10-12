@@ -111,6 +111,13 @@ extension Ghostty {
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
 
+                // Files and images pasted or dropped here, on their way to
+                // the remote host. Local to this build.
+                #if os(macOS)
+                UploadTray(uploads: surfaceView.uploads)
+                    .zIndex(1)
+                #endif
+
                 // If we have secure input enabled and we're the focused surface and window
                 // then we want to show the secure input overlay.
                 if ghostty.config.secureInputIndication &&

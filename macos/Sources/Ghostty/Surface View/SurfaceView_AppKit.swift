@@ -180,6 +180,11 @@ extension Ghostty {
         /// state so we're mixing this with direct surface access.
         private(set) var surfaceModel: Ghostty.Surface?
 
+        /// Local to this build: files and images pasted or dropped here are
+        /// uploaded to where the split runs, and their remote paths typed.
+        /// See SurfaceUpload.swift.
+        let uploads = SurfaceUploads()
+
         /// Returns the underlying C value for the surface. See "note" on surfaceModel.
         override var surface: ghostty_surface_t? {
             surfaceModel?.unsafeCValue
@@ -399,6 +404,9 @@ extension Ghostty {
 
             // The UTTypes that can be dragged onto this view.
             registerForDraggedTypes(Array(Self.dropTypes))
+
+            uploads.insert = { [weak self] text in self?.surfaceModel?.sendText(text) }
+            SurfaceUploads.warm()
         }
 
         required init?(coder: NSCoder) {
@@ -827,7 +835,11 @@ extension Ghostty {
 
         override func becomeFirstResponder() -> Bool {
             let result = super.becomeFirstResponder()
-            if result { focusDidChange(true) }
+            if result {
+                focusDidChange(true)
+                // Have the upload connection up before a paste needs it.
+                SurfaceUploads.warm()
+            }
             return result
         }
 
@@ -1335,6 +1347,14 @@ extension Ghostty {
                 return false
             }
 
+            // Local to this build: Cmd+V with files or an image on the
+            // clipboard uploads them instead of pasting their local paths.
+            // Plain text, the common case, costs one look at the declared
+            // pasteboard types and carries on as usual.
+            if Self.isPlainPaste(event), uploads.paste(from: .general) {
+                return true
+            }
+
             // Get information about if this is a binding.
             let bindingFlags = surfaceModel.flatMap { surface in
                 var ghosttyEvent = event.ghosttyKeyEvent(GHOSTTY_ACTION_PRESS)
@@ -1661,6 +1681,7 @@ extension Ghostty {
 
         @IBAction func paste(_ sender: Any?) {
             guard let surface = self.surface else { return }
+            if uploads.paste(from: .general) { return }
             let action = "paste_from_clipboard"
             if !ghostty_surface_binding_action(surface, action, UInt(action.lengthOfBytes(using: .utf8))) {
                 AppDelegate.logger.warning("action failed action=\(action, privacy: .public)")
@@ -2311,38 +2332,23 @@ extension Ghostty.SurfaceView {
         return .copy
     }
 
-    /// Local to this build: when ~/bin/ghostty-drop-upload exists, dropped files
-    /// are handed to it instead of having their local paths typed. It uploads
-    /// them to wherever the panes actually run and prints the paths to type in
-    /// their place. A failed upload types nothing.
-    static let dropUploader = FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent("bin/ghostty-drop-upload")
+    /// Whether this key is Cmd+V and nothing else.
+    static func isPlainPaste(_ event: NSEvent) -> Bool {
+        let mods = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+            .subtracting([.capsLock, .numericPad, .function])
+        return mods == .command && event.charactersIgnoringModifiers?.lowercased() == "v"
+    }
 
     override func performDragOperation(_ sender: any NSDraggingInfo) -> Bool {
         let pb = sender.draggingPasteboard
 
+        // Local to this build: dropped files are uploaded to where the split
+        // runs and their remote paths typed, the same as a paste. See
+        // SurfaceUpload.swift. Without ~/bin/ghostty-upload this is a no-op
+        // and the local paths are typed as usual.
         let files = (pb.readObjects(forClasses: [NSURL.self],
                                     options: [.urlReadingFileURLsOnly: true]) as? [URL]) ?? []
-        if !files.isEmpty,
-           FileManager.default.isExecutableFile(atPath: Self.dropUploader.path) {
-            DispatchQueue.global(qos: .userInitiated).async {
-                let p = Process()
-                p.executableURL = Self.dropUploader
-                p.arguments = files.map(\.path)
-                let out = Pipe()
-                p.standardOutput = out
-                p.standardError = FileHandle.nullDevice
-                guard (try? p.run()) != nil else { return }
-                let data = out.fileHandleForReading.readDataToEndOfFile()
-                p.waitUntilExit()
-                guard p.terminationStatus == 0,
-                      let text = String(data: data, encoding: .utf8)?
-                        .trimmingCharacters(in: .whitespacesAndNewlines),
-                      !text.isEmpty else { return }
-                DispatchQueue.main.async {
-                    self.surfaceModel?.sendText(text + " ")
-                }
-            }
+        if !files.isEmpty, uploads.start(files.map { .file($0) }) {
             return true
         }
 
