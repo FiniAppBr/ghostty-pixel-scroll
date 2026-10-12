@@ -228,17 +228,23 @@ pub const StreamHandler = struct {
             if (pred.len > 0) switch (action) {
                 .print => {
                     const c = self.terminal.screens.active.cursor;
-                    _ = pred.printed(value.cp, @intCast(c.x), @intCast(c.y));
+                    _ = pred.printed(
+                        value.cp,
+                        @intCast(c.x),
+                        @intCast(c.y),
+                        self.renderer_state.predictionNow(),
+                    );
                 },
                 // printSlice carries u32s. Anything that does not narrow
                 // to a codepoint is not something we could have typed, so
                 // stop rather than guess at where the rest landed.
                 .print_slice => {
                     const c = self.terminal.screens.active.cursor;
+                    const now = self.renderer_state.predictionNow();
                     var x: u16 = @intCast(c.x);
                     for (value.cps) |cp| {
                         const narrow = std.math.cast(u21, cp) orelse break;
-                        _ = pred.printed(narrow, x, @intCast(c.y));
+                        _ = pred.printed(narrow, x, @intCast(c.y), now);
                         x +%= 1;
                     }
                 },

@@ -46,6 +46,11 @@ prediction: predictionpkg.Engine = .{},
 /// can be tested without a clock; this is where those seconds come from.
 prediction_clock: ?std.Io.Timestamp = null,
 
+/// When a key was last sent, on the prediction clock. The renderer leaves
+/// the text and cursor around typing undecorated for a moment after it,
+/// so the characters being typed are not the ones fading in or trailing.
+last_key_at: ?f32 = null,
+
 /// The number of threads currently waiting to acquire `mutex` via
 /// `lockDemand`. This is not protected by the mutex; it is read by
 /// hot lock/unlock loops (the IO parse thread) in `yieldToDemand` to

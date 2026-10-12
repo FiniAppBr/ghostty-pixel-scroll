@@ -1083,16 +1083,18 @@ palette: Palette = .{},
 /// nothing is until echo is seen working again.
 @"local-echo": LocalEcho = .auto,
 
-/// How long to wait for the far end to echo a predicted character, in
-/// seconds, before concluding that no echo is coming and erasing what was
-/// drawn. Needs to be comfortably longer than the round trip, or ordinary
-/// slowness reads as a password prompt.
+/// The shortest time to wait for the far end to echo a predicted character,
+/// in seconds, before concluding that no echo is coming and erasing what was
+/// drawn. The actual wait follows the measured round trip and its jitter
+/// (capped at a second), so a slow or uneven link waits longer on its own;
+/// this is only the floor under that.
 @"local-echo-timeout": f32 = 0.15,
 
 /// How solid a predicted character looks before the far end confirms it, from
-/// 0 to 1. Below 1 a prediction is visibly a guess, so a wrong one reads as
-/// the terminal correcting itself rather than as text changing under you.
-@"local-echo-opacity": f32 = 0.6,
+/// 0 to 1. Predictions are only drawn once the current run of typing has
+/// echoed correctly, so by default they look exactly like the real thing.
+/// Below 1 a prediction is visibly a guess.
+@"local-echo-opacity": f32 = 1.0,
 
 /// The opacity level (opposite of transparency) of the background. A value of
 /// 1 is fully opaque and a value of 0 is fully transparent. A value less than 0

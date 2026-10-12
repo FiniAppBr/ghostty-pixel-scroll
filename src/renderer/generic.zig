@@ -359,6 +359,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// clock, so while this is set the renderer keeps waking to check.
         predicting: bool = false,
 
+        /// The viewport row predictions were drawn on last frame. Rows are
+        /// only rebuilt when the terminal dirties them, and nothing in the
+        /// terminal changes when a prediction appears or is withdrawn, so
+        /// this row is rebuilt by hand: otherwise a withdrawn prediction
+        /// would stay on screen until the far end next touched its row.
+        prediction_row: ?terminal.size.CellCountInt = null,
+
         const HighlightTag = enum(u8) {
             search_match,
             search_match_selected,
@@ -1969,7 +1976,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 links: terminal.RenderState.CellSet,
                 mouse: renderer.State.Mouse,
                 preedit: ?renderer.State.Preedit,
-                predictions: []const u21,
+                predictions: []const predictionpkg.Entry,
+                typing: bool,
                 scrollbar: terminal.Scrollbar,
                 overlay_features: []const Overlay.Feature,
             };
@@ -2141,19 +2149,27 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // frames are the only thing that notices time passing. A
                 // prediction that is never confirmed is what a password
                 // prompt looks like from here, so it must not linger.
-                const predictions: []const u21 = predictions: {
-                    state.prediction.tick(state.predictionNow());
+                const prediction_now = state.predictionNow();
+                const predictions: []const predictionpkg.Entry = predictions: {
+                    state.prediction.tick(prediction_now);
 
                     var buf: [predictionpkg.capacity]predictionpkg.Entry = undefined;
                     const drawn = state.prediction.drawn(&buf);
                     if (drawn.len == 0) break :predictions &.{};
 
-                    const cps = arena_alloc.alloc(u21, drawn.len) catch
-                        break :predictions &.{};
-                    for (drawn, cps) |e, *cp| cp.* = e.cp;
-                    break :predictions cps;
+                    break :predictions arena_alloc.dupe(
+                        predictionpkg.Entry,
+                        drawn,
+                    ) catch &.{};
                 };
-                self.predicting = predictions.len > 0;
+                self.predicting = state.prediction.len > 0;
+
+                // A key went out recently enough that what changes around
+                // the cursor is most likely its echo.
+                const typing = if (state.last_key_at) |at|
+                    prediction_now - at < 1.0
+                else
+                    false;
 
                 // Advance any running Kitty graphics animations to the
                 // frame due now, and remember when the next frame is
@@ -2236,6 +2252,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .mouse = state.mouse,
                     .preedit = preedit,
                     .predictions = predictions,
+                    .typing = typing,
                     .scrollbar = scrollbar,
                     .overlay_features = overlay_features,
                 };
@@ -2331,6 +2348,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 self.rebuildCells(
                     critical.preedit,
                     critical.predictions,
+                    critical.typing,
                     renderer.cursorStyle(&self.terminal_state, .{
                         .preedit = critical.preedit != null,
                         .focused = self.focused,
@@ -3218,6 +3236,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             y: terminal.size.CellCountInt,
             cells: *std.MultiArrayList(terminal.RenderState.Cell),
             now: f32,
+            echo: bool,
         ) void {
             if (y >= self.text_fade.rows.items.len) return;
             const rec = &self.text_fade.rows.items[y];
@@ -3245,6 +3264,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 len;
 
             if (len <= start) return;
+
+            // A few cells gained on the cursor's row just after a key is
+            // that key coming back. Short, so a command's output landing
+            // on the prompt line still fades as output.
+            if (echo and len - start <= 8) return;
+
             rec.x0 = start;
             rec.x1 = len;
             rec.at = now;
@@ -3709,7 +3734,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         fn rebuildCells(
             self: *Self,
             preedit: ?renderer.State.Preedit,
-            predictions: []const u21,
+            predictions: []const predictionpkg.Entry,
+            typing: bool,
             cursor_style_: ?renderer.CursorStyle,
             links: *const terminal.RenderState.CellSet,
         ) Allocator.Error!void {
@@ -3798,6 +3824,40 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 };
             } else null;
 
+            // Where predicted characters go, in viewport cells. The engine
+            // keeps them in active-screen coordinates; the cursor, which
+            // has both, gives the offset between the two. The real cells
+            // under them are skipped exactly as preedit's are, so a
+            // prediction over a placeholder hides it rather than being
+            // drawn on top of it.
+            const prediction_range: ?PreeditRange = predict: {
+                if (preedit != null or predictions.len == 0) break :predict null;
+                const cursor_vp = state.cursor.viewport orelse break :predict null;
+                const first = predictions[0];
+                const last = predictions[predictions.len - 1];
+                if (first.y != last.y) break :predict null;
+                const vp_y: i64 = @as(i64, cursor_vp.y) +
+                    @as(i64, first.y) - @as(i64, state.cursor.active.y);
+                if (vp_y < 0 or vp_y >= row_len) break :predict null;
+                if (first.x >= state.cols) break :predict null;
+                break :predict .{
+                    .y = @intCast(vp_y),
+                    .x = .{
+                        @intCast(first.x),
+                        @intCast(@min(last.x, state.cols - 1)),
+                    },
+                    .cp_offset = 0,
+                };
+            };
+
+            // Rebuild the rows predictions were on and are on now; see
+            // `prediction_row`.
+            if (self.prediction_row) |y| {
+                if (y < row_len) row_dirty[y] = true;
+            }
+            self.prediction_row = if (prediction_range) |r| r.y else null;
+            if (self.prediction_row) |y| row_dirty[y] = true;
+
             // Text that has just been written fades in. The records are
             // keyed by absolute row, so scrolling slides them along with
             // the text instead of making every row look freshly written.
@@ -3848,14 +3908,21 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 dirty.* = false;
 
                 if (track_writes and row_changed) {
-                    self.textFadeTrack(y, cells, self.text_fade.now);
+                    // The echo of a keystroke is not output to watch
+                    // arrive: it is what was just typed, and fading it in
+                    // makes every key look like it landed late.
+                    const echo = typing and if (state.cursor.viewport) |vp|
+                        vp.y == y
+                    else
+                        false;
+                    self.textFadeTrack(y, cells, self.text_fade.now, echo);
                 }
 
                 self.rebuildRow(
                     y,
                     row,
                     cells,
-                    preedit_range,
+                    preedit_range orelse prediction_range,
                     selection,
                     highlights,
                     links,
@@ -3897,10 +3964,22 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     self.cursor_corners.reset();
                 };
 
+                // Typing drawn ahead of its echo carries the cursor with
+                // it, to the cell after the last predicted character. The
+                // terminal's cursor gets there once the echo does.
+                var cursor_state = state.cursor;
+                if (prediction_range) |r| predicted: {
+                    const vp = if (cursor_state.viewport) |*v| v else break :predicted;
+                    if (vp.y != r.y or r.x[1] + 1 >= state.cols) break :predicted;
+                    vp.x = r.x[1] + 1;
+                    vp.wide_tail = false;
+                    cursor_state.cell = @bitCast(@as(u64, 0));
+                }
+
                 // If the cursor isn't visible on the viewport, don't show
                 // a cursor. Otherwise, get our cursor cell, because we may
                 // need it for styling.
-                const cursor_vp = state.cursor.viewport orelse break :cursor;
+                const cursor_vp = cursor_state.viewport orelse break :cursor;
                 const cursor_style: terminal.Style = cursor_style: {
                     const cells = state.row_data.items(.cells);
                     const cell = cells[cursor_vp.y].get(cursor_vp.x);
@@ -3935,7 +4014,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                                 .bold = self.config.bold_color,
                             });
                             const bg_style = cursor_style.bg(
-                                &state.cursor.cell,
+                                &cursor_state.cell,
                                 &state.colors.palette,
                             ) orelse state.colors.background;
 
@@ -3958,7 +4037,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
                 cursor_drawn = true;
                 self.addCursor(
-                    &state.cursor,
+                    &cursor_state,
                     style,
                     cursor_color,
                 );
@@ -3997,6 +4076,15 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     const dx: i64 = pos.x - prev.x;
                     const dy: i64 = pos.y - prev.y;
                     if (dx == 0 and dy == 0) break :cursor_anim;
+
+                    // A step or two along the line while typing is the
+                    // cursor keeping up with the text. Animated, it trails
+                    // the characters it should sit after, which reads as
+                    // input lag rather than motion.
+                    if (typing and dy == 0 and @abs(dx) <= 8) {
+                        self.cursor_corners.reset();
+                        break :cursor_anim;
+                    }
 
                     const cw: f32 = @floatFromInt(self.grid_metrics.cell_width);
                     const ch: f32 = @floatFromInt(self.grid_metrics.cell_height);
@@ -4043,7 +4131,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
                 // If the cursor is visible then we set our uniforms.
                 if (style == .block) {
-                    const wide = state.cursor.cell.wide;
+                    const wide = cursor_state.cell.wide;
 
                     self.uniforms.cursor_pos = .{
                         // If we are a spacer tail of a wide cell, our cursor needs
@@ -4075,7 +4163,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                             .bold = self.config.bold_color,
                         });
                         const bg_style = cursor_style.bg(
-                            &state.cursor.cell,
+                            &cursor_state.cell,
                             &state.colors.palette,
                         ) orelse state.colors.background;
 
@@ -4128,29 +4216,26 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // terminal has not seen them, so its cursor still sits where
             // the first one goes, and anything that would have moved the
             // cursor another way abandoned them before we got here.
-            if (predictions.len > 0) predict: {
-                const cursor_vp = state.cursor.viewport orelse break :predict;
+            if (prediction_range) |range| predict: {
                 const alpha: u8 = @intFromFloat(@round(
                     @max(0.0, @min(1.0, self.config.local_echo_opacity)) * 255.0,
                 ));
 
-                var x: usize = cursor_vp.x;
-                for (predictions) |cp| {
-                    if (x >= state.cols) break;
+                for (predictions) |e| {
+                    if (e.x > range.x[1]) break;
                     self.addPredictionCell(
-                        cp,
-                        @intCast(x),
-                        @intCast(cursor_vp.y),
+                        e.cp,
+                        @intCast(e.x),
+                        range.y,
                         state.colors.foreground,
                         alpha,
                     ) catch |err| {
                         log.warn(
                             "error building prediction cell x={} y={} err={}",
-                            .{ x, cursor_vp.y, err },
+                            .{ e.x, range.y, err },
                         );
                         break :predict;
                     };
-                    x += 1;
                 }
             }
 

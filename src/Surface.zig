@@ -2862,6 +2862,15 @@ pub fn keyCallback(
             return .closed;
         }
 
+        // Record the prediction before the key leaves. On a local shell the
+        // echo can be back before this function returns, and an echo that
+        // arrives ahead of its prediction confirms nothing.
+        if (!event.key.modifier()) {
+            self.renderer_state.mutex.lockUncancelable(global.io());
+            defer self.renderer_state.mutex.unlock(global.io());
+            self.recordPrediction(event);
+        }
+
         self.queueIo(switch (write_req) {
             .small => |v| .{ .write_small = v },
             .stable => |v| .{ .write_stable = v },
@@ -2887,24 +2896,25 @@ pub fn keyCallback(
 
         if (self.config.scroll_to_bottom.keystroke) self.io.terminal.scrollViewport(.bottom);
 
-        // Draw this keystroke ahead of the far end's echo, where that has
-        // been earned. Anything we cannot place confidently abandons the
-        // predictions already on screen rather than guessing past it.
-        self.recordPrediction(event);
-
         try self.queueRender();
     }
 
     return .consumed;
 }
 
-/// Record a keypress as a local echo prediction, or abandon the predictions
-/// in flight if this key is not one whose effect we can place.
+/// Draw this keystroke ahead of the far end's echo, where that has been
+/// earned. Anything we cannot place confidently abandons the predictions
+/// already on screen rather than guessing past it.
 ///
 /// Must be called with the renderer state mutex held.
 fn recordPrediction(self: *Surface, event: input.KeyEvent) void {
     const state = &self.renderer_state;
     const pred = &state.prediction;
+    const now = state.predictionNow();
+
+    // The renderer keeps typing out of the text fade and the cursor
+    // animation; both read as lag on the very characters being typed.
+    state.last_key_at = now;
 
     if (self.config.local_echo == .never) {
         pred.flush();
@@ -2923,7 +2933,7 @@ fn recordPrediction(self: *Surface, event: input.KeyEvent) void {
         event.mods.alt,
         event.mods.super,
     ) orelse {
-        pred.flush();
+        pred.interrupt(predictionInterruption(event));
         return;
     };
 
@@ -2932,9 +2942,21 @@ fn recordPrediction(self: *Surface, event: input.KeyEvent) void {
     // Full-screen programs repaint rather than echo, so a character typed
     // into one does not come back in any form we can match.
     if (t.screens.active_key == .alternate) {
-        pred.flush();
+        pred.interrupt(.boundary);
         return;
     }
+
+    // The pty itself says echo is off: a local password prompt.
+    if (t.flags.password_input) {
+        pred.interrupt(.boundary);
+        return;
+    }
+
+    // A hidden cursor is a program part-way through drawing, parked
+    // wherever its last write left it rather than where typing goes.
+    // Only the first character of a burst reads the cursor; the rest
+    // follow the one before them.
+    if (pred.len == 0 and !t.modes.get(.cursor_visible)) return;
 
     const cursor = t.screens.active.cursor;
     _ = pred.typed(
@@ -2942,8 +2964,27 @@ fn recordPrediction(self: *Surface, event: input.KeyEvent) void {
         @intCast(cursor.x),
         @intCast(cursor.y),
         @intCast(t.cols),
-        state.predictionNow(),
+        now,
     );
+}
+
+/// Whether a key that types nothing leaves the same program reading the
+/// keys (an edit within the line) or may have handed them to another
+/// (return, escape, a chord), which is where a password prompt can start.
+fn predictionInterruption(event: input.KeyEvent) predictionpkg.Interruption {
+    if (event.mods.ctrl or event.mods.alt or event.mods.super) return .boundary;
+    return switch (event.key) {
+        .backspace,
+        .delete,
+        .arrow_left,
+        .arrow_right,
+        .arrow_up,
+        .arrow_down,
+        .home,
+        .end,
+        => .edit,
+        else => .boundary,
+    };
 }
 
 /// Maybe handles a binding for a given event and if so returns the effect.
