@@ -3267,8 +3267,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             // A few cells gained on the cursor's row just after a key is
             // that key coming back. Short, so a command's output landing
-            // on the prompt line still fades as output.
-            if (echo and len - start <= 8) return;
+            // on the prompt line still fades as output. It is still where
+            // the program is writing, so it moves the write head and the
+            // smoke keeps coming off the keys; only the fade is skipped.
+            if (echo and len - start <= 8) {
+                self.write_head = .{ .y = y, .x = len - 1 };
+                return;
+            }
 
             rec.x0 = start;
             rec.x1 = len;
