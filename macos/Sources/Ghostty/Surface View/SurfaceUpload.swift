@@ -92,12 +92,16 @@ enum UploadClassifier {
 
 /// Screenshots come off the pasteboard as full-resolution PNG or TIFF: a Retina
 /// screenshot is several megabytes, which is seconds over a home uplink. What
-/// reads it on the other end is a model that scales images down to about 1.5k
-/// pixels on the long edge anyway, so anything past that is bytes spent on
-/// detail nobody sees. Scale to `maxEdge` and keep whichever of PNG or JPEG is
-/// smaller, with a thumb on the scale for PNG, which keeps text crisp.
+/// reads it on the other end is a model that bills an image by its pixel
+/// count (about width x height / 750 tokens) and scales anything past 1568 on
+/// the long edge down anyway. So the size is a token budget: shrink until the
+/// image is at most `maxPixels` (about 1,000 tokens), which keeps UI text
+/// readable, and never past `maxEdge`. Smaller images go untouched. Then keep
+/// whichever of PNG or JPEG is smaller, with a thumb on the scale for PNG,
+/// which keeps text crisp.
 enum UploadImageEncoder {
-    static let maxEdge = 2000
+    static let maxEdge = 1568
+    static let maxPixels = 750_000
     static let jpegQuality = 0.86
 
     struct Encoded {
@@ -112,7 +116,10 @@ enum UploadImageEncoder {
 
         guard let rep = NSBitmapImageRep(data: data), let cg = rep.cgImage else { return nil }
         let w = cg.width, h = cg.height
-        let scale = min(1.0, Double(maxEdge) / Double(max(w, h)))
+        let scale = min(
+            1.0,
+            Double(maxEdge) / Double(max(w, h)),
+            (Double(maxPixels) / Double(w * h)).squareRoot())
 
         let image: CGImage
         if scale < 1 {
